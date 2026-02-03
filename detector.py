@@ -30,7 +30,10 @@ except ImportError:
 ANOMALY_THRESHOLD_SIGMA = 3.0
 
 # Минимальное отклонение для попадания в отчет (%)
-MIN_DEVIATION_PERCENT = 500
+MIN_DEVIATION_PERCENT = 300
+
+# Минимальный средний дневной оборот для анализа (руб)
+MIN_AVG_VALUE = 10_000_000  # 10 млн руб
 
 # Префиксы тикеров для исключения (облигации, ISIN коды и т.д.)
 EXCLUDED_TICKER_PREFIXES = ("RU000",)
@@ -292,7 +295,8 @@ def calculate_statistics(base_data: List[Dict], target_data: Dict) -> Dict:
 
 def find_anomalies(stats: Dict, threshold: float) -> List[Tuple[str, Dict]]:
     """
-    Найти аномалии - тикеры с Z-score выше порога И отклонением выше минимума
+    Найти аномалии - тикеры с Z-score выше порога, отклонением выше минимума
+    и средним оборотом выше минимального
 
     Args:
         stats: Статистика по тикерам
@@ -303,7 +307,9 @@ def find_anomalies(stats: Dict, threshold: float) -> List[Tuple[str, Dict]]:
     """
     anomalies = [
         (ticker, info) for ticker, info in stats.items()
-        if info['z_score'] > threshold and info['deviation_pct'] > MIN_DEVIATION_PERCENT
+        if info['z_score'] > threshold
+        and info['deviation_pct'] > MIN_DEVIATION_PERCENT
+        and info['mean_value'] >= MIN_AVG_VALUE
     ]
     
     # Сортировка по Z-score (от большего к меньшему)
