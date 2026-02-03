@@ -27,7 +27,10 @@ except ImportError:
 # ============================================================================
 
 # Порог аномалии в стандартных отклонениях (σ)
-ANOMALY_THRESHOLD_SIGMA = 2.0
+ANOMALY_THRESHOLD_SIGMA = 3.0
+
+# Префиксы тикеров для исключения (облигации, ISIN коды и т.д.)
+EXCLUDED_TICKER_PREFIXES = ("RU000",)
 
 # Параметры API
 MOEX_API_BASE = "https://iss.moex.com/iss"
@@ -139,22 +142,27 @@ def fetch_volumes_from_api(date: str) -> Dict:
 def aggregate_ticker_data(raw_data: List) -> Dict:
     """
     Агрегировать данные по тикерам (суммировать дубли из разных режимов торгов)
-    
+
     Args:
         raw_data: Список записей [SECID, SHORTNAME, VOLUME, VALUE, NUMTRADES]
-    
+
     Returns:
         Словарь вида {ticker: {shortname, volume, value, numtrades}}
     """
     aggregated = {}
-    
+
     for row in raw_data:
         secid = row[0]
+
+        # Пропускаем тикеры с исключенными префиксами (облигации, ISIN и т.д.)
+        if secid.startswith(EXCLUDED_TICKER_PREFIXES):
+            continue
+
         shortname = row[1]
         volume = row[2] or 0
         value = row[3] or 0
         numtrades = row[4] or 0
-        
+
         if secid not in aggregated:
             aggregated[secid] = {
                 'shortname': shortname,
