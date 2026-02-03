@@ -29,8 +29,14 @@ except ImportError:
 # Порог аномалии в стандартных отклонениях (σ)
 ANOMALY_THRESHOLD_SIGMA = 3.0
 
+# Минимальное отклонение для попадания в отчет (%)
+MIN_DEVIATION_PERCENT = 500
+
 # Префиксы тикеров для исключения (облигации, ISIN коды и т.д.)
 EXCLUDED_TICKER_PREFIXES = ("RU000",)
+
+# Ключевые слова в названии для исключения (ETF и т.д.)
+EXCLUDED_SHORTNAME_KEYWORDS = ("ETF",)
 
 # Параметры API
 MOEX_API_BASE = "https://iss.moex.com/iss"
@@ -231,6 +237,11 @@ def calculate_statistics(base_data: List[Dict], target_data: Dict) -> Dict:
         if ticker.startswith(EXCLUDED_TICKER_PREFIXES):
             continue
 
+        # Пропускаем тикеры с исключенными ключевыми словами в названии (ETF и т.д.)
+        shortname = target_info.get('shortname', '')
+        if any(keyword in shortname.upper() for keyword in EXCLUDED_SHORTNAME_KEYWORDS):
+            continue
+
         # Собрать значения VALUE за базовый период
         values = []
         for day_data in base_data:
@@ -281,18 +292,18 @@ def calculate_statistics(base_data: List[Dict], target_data: Dict) -> Dict:
 
 def find_anomalies(stats: Dict, threshold: float) -> List[Tuple[str, Dict]]:
     """
-    Найти аномалии - тикеры с Z-score выше порога
-    
+    Найти аномалии - тикеры с Z-score выше порога И отклонением выше минимума
+
     Args:
         stats: Статистика по тикерам
         threshold: Порог в сигмах
-    
+
     Returns:
         Отсортированный список кортежей (ticker, stats_dict)
     """
     anomalies = [
         (ticker, info) for ticker, info in stats.items()
-        if info['z_score'] > threshold
+        if info['z_score'] > threshold and info['deviation_pct'] > MIN_DEVIATION_PERCENT
     ]
     
     # Сортировка по Z-score (от большего к меньшему)
