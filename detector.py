@@ -225,8 +225,12 @@ def calculate_statistics(base_data: List[Dict], target_data: Dict) -> Dict:
     """
     stats = {}
     warnings = []
-    
+
     for ticker, target_info in target_data.items():
+        # Пропускаем тикеры с исключенными префиксами
+        if ticker.startswith(EXCLUDED_TICKER_PREFIXES):
+            continue
+
         # Собрать значения VALUE за базовый период
         values = []
         for day_data in base_data:
