@@ -1,0 +1,4 @@
+# Запуск детектора аномалий каждый день в 10:00 по Москве
+0 10 * * 1-5 root cd /app && python detector.py >> /var/log/detector.log 2>&1 && python /app/web/generate_index.py && python /app/notify.py
+
+# Пустая строка в конце обязательна для cron

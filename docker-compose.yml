@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  detector:
+    build: .
+    container_name: moex-anomaly-detector
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - detector-data:/app/data
+      - detector-reports:/app/reports
+    environment:
+      - TZ=Europe/Moscow
+      # Telegram уведомления (опционально)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      # Отправлять уведомления даже без аномалий
+      - NOTIFY_ALWAYS=${NOTIFY_ALWAYS:-0}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  detector-data:
+  detector-reports:
