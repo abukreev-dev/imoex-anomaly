@@ -202,22 +202,27 @@ def load_or_fetch_data(date: str, force: bool = False) -> Dict:
     
     # Попытка загрузить из кеша
     if not force and cache_file.exists():
-        print(f"  Загрузка из кеша: {date}")
         with open(cache_file, 'r', encoding='utf-8') as f:
             cached = json.load(f)
-            return cached['tickers']
-    
+            # Не используем кеш если данные пустые (были закэшированы до появления данных)
+            if cached['tickers']:
+                print(f"  Загрузка из кеша: {date}")
+                return cached['tickers']
+            else:
+                print(f"  Кеш за {date} пустой, повторный запрос к API...")
+
     # Загрузка с API
     data = fetch_volumes_from_api(date)
-    
-    # Сохранение в кеш
-    cache_data = {
-        'date': date,
-        'tickers': data
-    }
-    with open(cache_file, 'w', encoding='utf-8') as f:
-        json.dump(cache_data, f, ensure_ascii=False, indent=2)
-    
+
+    # Сохраняем в кеш только непустые данные
+    if data:
+        cache_data = {
+            'date': date,
+            'tickers': data
+        }
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
     return data
 
 
