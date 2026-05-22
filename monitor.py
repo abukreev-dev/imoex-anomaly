@@ -272,9 +272,9 @@ def format_alert(ticker: str, info: dict, details: Optional[dict]) -> str:
     if price_change is None:
         head_emoji = "📊"
     elif price_change > 0:
-        head_emoji = "📈"
+        head_emoji = "🟩 📈"
     else:
-        head_emoji = "📉"
+        head_emoji = "🟥 📉"
 
     lines = [
         f"{head_emoji} <b>{html.escape(ticker)}</b> — {shortname}",
