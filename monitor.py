@@ -44,6 +44,8 @@ TRADES_URL_TPL = f"{MOEX_API_BASE}/engines/stock/markets/shares/securities/{{sec
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# Прокси применяется ТОЛЬКО к запросам в api.telegram.org. Запросы к MOEX идут напрямую.
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()
 
 HTTP_TIMEOUT = 20
 
@@ -297,13 +299,14 @@ def send_telegram(text: str) -> bool:
         log("Telegram не настроен (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), пропуск")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    proxies = {"http": TELEGRAM_PROXY, "https": TELEGRAM_PROXY} if TELEGRAM_PROXY else None
     try:
         r = requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
-        }, timeout=HTTP_TIMEOUT)
+        }, timeout=HTTP_TIMEOUT, proxies=proxies)
         r.raise_for_status()
         return True
     except requests.RequestException as e:
