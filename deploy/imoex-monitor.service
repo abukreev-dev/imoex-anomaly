@@ -1,0 +1,17 @@
+[Unit]
+Description=MOEX intraday volume anomaly monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/imoex-anomaly
+EnvironmentFile=/etc/imoex-monitor.env
+ExecStart=/usr/bin/python3 /opt/imoex-anomaly/monitor.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
