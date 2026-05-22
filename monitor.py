@@ -8,7 +8,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Все datetime.now() / time.localtime() в MSK независимо от TZ системы.
 os.environ["TZ"] = "Europe/Moscow"
@@ -41,6 +41,9 @@ EXCLUDED_SHORTNAME_KEYWORDS = ("ETF",)
 MOEX_API_BASE = "https://iss.moex.com/iss"
 SNAPSHOT_URL = f"{MOEX_API_BASE}/engines/stock/markets/shares/securities.json"
 TRADES_URL_TPL = f"{MOEX_API_BASE}/engines/stock/markets/shares/securities/{{secid}}/trades.json"
+ORDERBOOK_URL_TPL = f"{MOEX_API_BASE}/engines/stock/markets/shares/securities/{{secid}}/orderbook.json"
+INDEX_URL = f"{MOEX_API_BASE}/engines/stock/markets/index/securities.json"
+MOEX_PAGE_URL_TPL = "https://www.moex.com/ru/issue.aspx?code={ticker}"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -99,13 +102,18 @@ def reset_state() -> None:
 # API
 # ============================================================================
 
-def fetch_snapshot() -> Optional[Tuple[Dict[str, str], Dict[str, float]]]:
-    """Один запрос на всю биржу: имена + накопленный с открытия VALTODAY."""
+def fetch_snapshot() -> Optional[Tuple[Dict[str, str], Dict[str, float], Dict[str, dict]]]:
+    """Один запрос на всю биржу: имена, VALTODAY и дневная картина по каждому тикеру.
+
+    Возвращает (shortnames, valtoday, daily), где daily[ticker] = {
+        last, open, low, high, last_to_prev (%), valtoday
+    }. Поля могут быть None если данных нет (например, по неактивной доске).
+    """
     params = {
         "iss.meta": "off",
         "iss.only": "securities,marketdata",
         "securities.columns": "SECID,SHORTNAME,BOARDID",
-        "marketdata.columns": "SECID,BOARDID,VALTODAY",
+        "marketdata.columns": "SECID,BOARDID,VALTODAY,LAST,OPEN,LOW,HIGH,LASTTOPREVPRICE",
     }
     try:
         r = requests.get(SNAPSHOT_URL, params=params, timeout=HTTP_TIMEOUT)
@@ -119,14 +127,85 @@ def fetch_snapshot() -> Optional[Tuple[Dict[str, str], Dict[str, float]]]:
     for secid, shortname, _board in data.get("securities", {}).get("data", []):
         shortnames.setdefault(secid, shortname)
 
-    # VALTODAY суммируем по всем режимам торгов одного тикера.
     valtoday: Dict[str, float] = {}
-    for secid, _board, val in data.get("marketdata", {}).get("data", []):
-        if val is None:
-            continue
-        valtoday[secid] = valtoday.get(secid, 0.0) + float(val)
+    daily: Dict[str, dict] = {}
+    for secid, _board, val, last, open_, low, high, last_to_prev in \
+            data.get("marketdata", {}).get("data", []):
+        if val is not None:
+            valtoday[secid] = valtoday.get(secid, 0.0) + float(val)
+        # Первая строка с непустым LAST — берём её как «основную» для дневной картины.
+        if secid not in daily and last is not None:
+            daily[secid] = {
+                "last": float(last),
+                "open": float(open_) if open_ is not None else None,
+                "low": float(low) if low is not None else None,
+                "high": float(high) if high is not None else None,
+                "last_to_prev": float(last_to_prev) if last_to_prev is not None else None,
+            }
 
-    return shortnames, valtoday
+    # Достроить VALTODAY в daily (после агрегации по всем доскам).
+    for ticker, vt in valtoday.items():
+        if ticker in daily:
+            daily[ticker]["valtoday"] = vt
+
+    return shortnames, valtoday, daily
+
+
+def fetch_index_context() -> Optional[float]:
+    """Изменение IMOEX за день в %. None если не удалось получить."""
+    params = {
+        "iss.meta": "off",
+        "iss.only": "securities",
+        "securities.columns": "SECID,LASTCHANGEPRC",
+    }
+    try:
+        r = requests.get(INDEX_URL, params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log(f"index error: {e}")
+        return None
+
+    for row in data.get("securities", {}).get("data", []):
+        if row and row[0] == "IMOEX" and row[1] is not None:
+            return float(row[1])
+    return None
+
+
+def fetch_orderbook(secid: str, top_n: int = 3) -> Optional[dict]:
+    """Топ-N бид/аск из стакана. None если рынок закрыт или ошибка."""
+    url = ORDERBOOK_URL_TPL.format(secid=secid)
+    params = {
+        "iss.meta": "off",
+        "iss.only": "orderbook",
+        "orderbook.columns": "BUYSELL,PRICE,QUANTITY",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        # На закрытом рынке MOEX отдаёт 200 OK с HTML-заглушкой → ValueError на json().
+        data = r.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    rows = data.get("orderbook", {}).get("data", [])
+    if not rows:
+        return None
+
+    bids: List[Tuple[float, int]] = []  # (price, qty), от лучшей цены
+    asks: List[Tuple[float, int]] = []
+    for side, price, qty in rows:
+        if price is None or qty is None:
+            continue
+        if side == "B":
+            bids.append((float(price), int(qty)))
+        elif side == "S":
+            asks.append((float(price), int(qty)))
+
+    bids.sort(key=lambda x: x[0], reverse=True)
+    asks.sort(key=lambda x: x[0])
+
+    return {"bids": bids[:top_n], "asks": asks[:top_n]}
 
 
 def fetch_ticker_trades(secid: str) -> list:
@@ -221,7 +300,7 @@ def detect_anomalies(deltas: Dict[str, float]) -> list:
 
 
 def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
-    """Разложить сделки тикера за последнюю минуту на buy/sell и т.п."""
+    """Разложить сделки тикера за последнюю минуту на buy/sell + топ-3 по обороту."""
     if not trades:
         return None
 
@@ -244,7 +323,7 @@ def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
     if price_first and price_last and price_first > 0:
         price_change_pct = (price_last - price_first) / price_first * 100
 
-    top_trade = max(recent, key=lambda t: float(t.get("VALUE") or 0))
+    top3 = sorted(recent, key=lambda t: float(t.get("VALUE") or 0), reverse=True)[:3]
 
     return {
         "buy_value": buy_value,
@@ -254,8 +333,7 @@ def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
         "trades_count": len(recent),
         "price_last": price_last,
         "price_change_pct": price_change_pct,
-        "top_value": float(top_trade.get("VALUE") or 0),
-        "top_side": top_trade.get("BUYSELL"),
+        "top3": top3,
     }
 
 
@@ -263,15 +341,28 @@ def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
 # TELEGRAM
 # ============================================================================
 
-def format_alert(ticker: str, info: dict, details: Optional[dict]) -> str:
+def format_alert(
+    ticker: str,
+    info: dict,
+    details: Optional[dict],
+    daily: Optional[dict],
+    market_change_pct: Optional[float],
+    orderbook: Optional[dict],
+) -> str:
     multiplier = info["delta"] / info["mean"] if info["mean"] > 0 else 0
     shortname = html.escape(info["shortname"])
 
-    # TG HTML не поддерживает цвет текста — направление передаём эмодзи в шапке.
-    price_change = details.get("price_change_pct") if details else None
-    if price_change is None:
+    # Цвет шапки = дневной импульс тикера (LASTTOPREVPRICE) если есть,
+    # иначе откатываемся на минутный price_change.
+    direction = None
+    if daily and daily.get("last_to_prev") is not None:
+        direction = daily["last_to_prev"]
+    elif details and details.get("price_change_pct") is not None:
+        direction = details["price_change_pct"]
+
+    if direction is None:
         head_emoji = "📊"
-    elif price_change > 0:
+    elif direction > 0:
         head_emoji = "🟩 📈"
     else:
         head_emoji = "🟥 📉"
@@ -283,22 +374,68 @@ def format_alert(ticker: str, info: dict, details: Optional[dict]) -> str:
         f"Z-score: +{info['z']:.1f} | окно {info['window_size']} мин",
     ]
 
+    # Дневная картина: LAST, изменение от пред. закрытия, диапазон, общий оборот.
+    if daily:
+        last = daily.get("last")
+        ltp = daily.get("last_to_prev")
+        if last is not None:
+            day_line = f"Цена: <b>{last:.2f}</b>"
+            if ltp is not None:
+                day_line += f" ({ltp:+.2f}% к закр.)"
+            lines.append(day_line)
+        low, high, open_ = daily.get("low"), daily.get("high"), daily.get("open")
+        if low is not None and high is not None:
+            range_line = f"День: L {low:.2f} / H {high:.2f}"
+            if open_ is not None:
+                range_line += f" · O {open_:.2f}"
+            lines.append(range_line)
+        vt = daily.get("valtoday")
+        if vt:
+            lines.append(f"Оборот за день: {format_number(vt)} руб")
+
+    if market_change_pct is not None:
+        m_emoji = "🟢" if market_change_pct >= 0 else "🔴"
+        lines.append(f"IMOEX: {m_emoji} {market_change_pct:+.2f}%")
+
     if details:
         lines.append("")
         lines.append(f"Покупки: {details['buy_pct']:.0f}% "
                      f"({format_number(details['buy_value'])})")
         lines.append(f"Продажи: {details['sell_pct']:.0f}% "
                      f"({format_number(details['sell_value'])})")
-        if details["price_last"] is not None:
-            line = f"Цена: {details['price_last']:.2f}"
-            if details["price_change_pct"] is not None:
-                line += f" ({details['price_change_pct']:+.2f}% мин)"
-            lines.append(line)
-        side = "buy" if details["top_side"] == "B" else "sell"
-        lines.append(f"Топ-сделка: {format_number(details['top_value'])} руб ({side})")
+        if details["price_last"] is not None and details["price_change_pct"] is not None:
+            lines.append(f"Минута: {details['price_last']:.2f} "
+                         f"({details['price_change_pct']:+.2f}%)")
         lines.append(f"Сделок в минуту: {details['trades_count']}")
 
+        top3 = details.get("top3") or []
+        if top3:
+            lines.append("")
+            lines.append("Топ-сделки минуты:")
+            for t in top3:
+                side = "buy" if t.get("BUYSELL") == "B" else "sell"
+                val = float(t.get("VALUE") or 0)
+                price = t.get("PRICE")
+                qty = t.get("QUANTITY")
+                bits = [format_number(val) + " руб", side]
+                if price is not None and qty is not None:
+                    bits.append(f"{int(qty)}@{float(price):.2f}")
+                lines.append("• " + " · ".join(bits))
+
+    if orderbook and (orderbook.get("bids") or orderbook.get("asks")):
+        lines.append("")
+        lines.append("Стакан (топ-3):")
+        asks = orderbook.get("asks") or []
+        bids = orderbook.get("bids") or []
+        # Аски выводим сверху вниз (от худшей к лучшей), биды — от лучшей к худшей.
+        for price, qty in reversed(asks):
+            lines.append(f"   ask {price:.2f} × {qty}")
+        for price, qty in bids:
+            lines.append(f"   bid {price:.2f} × {qty}")
+
     lines.append("")
+    lines.append(f'<a href="{MOEX_PAGE_URL_TPL.format(ticker=html.escape(ticker))}">'
+                 f"страница на MOEX</a>")
     lines.append(datetime.now().strftime("%H:%M MSK · %Y-%m-%d"))
     return "\n".join(lines)
 
@@ -331,7 +468,7 @@ def tick() -> None:
     snapshot = fetch_snapshot()
     if snapshot is None:
         return
-    shortnames, valtoday = snapshot
+    shortnames, valtoday, daily = snapshot
 
     SHORTNAMES.update(shortnames)
     deltas = update_windows(valtoday)
@@ -345,13 +482,23 @@ def tick() -> None:
     else:
         log(f"snapshot OK {len(valtoday)} tickers · no anomalies")
 
+    if not anomalies:
+        return
+
+    # IMOEX тянем один раз на тик (только если есть что слать).
+    market_change_pct = fetch_index_context()
+
     now = datetime.now()
     for ticker, info in anomalies:
         if COOLDOWNS.get(ticker, datetime.min) > now:
             continue
         trades = fetch_ticker_trades(ticker)
         details = analyze_ticker_trades(trades, since=now - timedelta(minutes=1))
-        msg = format_alert(ticker, info, details)
+        orderbook = fetch_orderbook(ticker)
+        msg = format_alert(
+            ticker, info, details,
+            daily.get(ticker), market_change_pct, orderbook,
+        )
         if send_telegram(msg):
             COOLDOWNS[ticker] = now + timedelta(minutes=COOLDOWN_MINUTES)
             log(f"alert sent: {ticker}")
