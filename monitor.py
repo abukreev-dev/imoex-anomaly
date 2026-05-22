@@ -267,8 +267,17 @@ def format_alert(ticker: str, info: dict, details: Optional[dict]) -> str:
     multiplier = info["delta"] / info["mean"] if info["mean"] > 0 else 0
     shortname = html.escape(info["shortname"])
 
+    # TG HTML не поддерживает цвет текста — направление передаём эмодзи в шапке.
+    price_change = details.get("price_change_pct") if details else None
+    if price_change is None:
+        head_emoji = "📊"
+    elif price_change > 0:
+        head_emoji = "📈"
+    else:
+        head_emoji = "📉"
+
     lines = [
-        f"🚀 <b>{html.escape(ticker)}</b> — {shortname}",
+        f"{head_emoji} <b>{html.escape(ticker)}</b> — {shortname}",
         f"Оборот за минуту: <b>{format_number(info['delta'])} руб</b> "
         f"(×{multiplier:.1f} от среднего)",
         f"Z-score: +{info['z']:.1f} | окно {info['window_size']} мин",
@@ -276,9 +285,9 @@ def format_alert(ticker: str, info: dict, details: Optional[dict]) -> str:
 
     if details:
         lines.append("")
-        lines.append(f"🟢 Покупки: {details['buy_pct']:.0f}% "
+        lines.append(f"Покупки: {details['buy_pct']:.0f}% "
                      f"({format_number(details['buy_value'])})")
-        lines.append(f"🔴 Продажи: {details['sell_pct']:.0f}% "
+        lines.append(f"Продажи: {details['sell_pct']:.0f}% "
                      f"({format_number(details['sell_value'])})")
         if details["price_last"] is not None:
             line = f"Цена: {details['price_last']:.2f}"
