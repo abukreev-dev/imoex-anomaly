@@ -31,6 +31,16 @@ WINDOW_MINUTES = 30
 MIN_POINTS_FOR_STATS = 10
 COOLDOWN_MINUTES = 30
 
+# Block trade: «одна большая сделка» детектится без trades.json через NUMTRADES.
+# Сигнал: в минуту прошло мало сделок, но оборот значимый → средняя сделка огромная.
+BLOCK_MIN_MINUTE_VALUE = 5_000_000      # руб, отсекаем мелкий шум
+BLOCK_MIN_AVG_TRADE_SIZE = 2_000_000    # руб/сделка средняя за эту минуту
+
+# Price spike: цена дёрнулась без сопоставимого объёма (тонкий стакан проткнули).
+SPIKE_MIN_PRICE_PCT = 1.0               # |Δцены за минуту| ≥ 1%
+SPIKE_MIN_DELTA_VAL = 50_000            # руб, минимум — хоть что-то торговалось
+SPIKE_MAX_DELTA_VS_MEAN = 3.0           # выше — это уже volume anomaly, не spike
+
 # Спим с 23:50 до 06:50 MSK (между вечеркой и утренней сессией).
 SLEEP_START_MIN = 23 * 60 + 50
 SLEEP_END_MIN = 6 * 60 + 50
@@ -56,10 +66,13 @@ HTTP_TIMEOUT = 20
 # СОСТОЯНИЕ
 # ============================================================================
 
-WINDOWS: Dict[str, deque] = {}           # {ticker: deque[delta_per_minute]}
-LAST_VALTODAY: Dict[str, float] = {}     # {ticker: VALTODAY на прошлом замере}
-SHORTNAMES: Dict[str, str] = {}          # {ticker: shortname}
-COOLDOWNS: Dict[str, datetime] = {}      # {ticker: время окончания кулдауна}
+WINDOWS: Dict[str, deque] = {}                 # {ticker: deque[delta_per_minute]}
+LAST_VALTODAY: Dict[str, float] = {}           # {ticker: VALTODAY на прошлом замере}
+LAST_NUMTRADES: Dict[str, int] = {}            # {ticker: NUMTRADES на прошлом замере}
+LAST_PRICES: Dict[str, float] = {}             # {ticker: LAST цена на прошлом замере}
+SHORTNAMES: Dict[str, str] = {}                # {ticker: shortname}
+# COOLDOWNS keyed by (kind, ticker) — у каждого типа алерта свой кулдаун.
+COOLDOWNS: Dict[Tuple[str, str], datetime] = {}
 
 
 def log(msg: str) -> None:
@@ -92,9 +105,11 @@ def is_sleep_time(now: Optional[datetime] = None) -> bool:
 
 
 def reset_state() -> None:
-    """Сбросить окна и кеш VALTODAY (после ночи или холодного старта)."""
+    """Сбросить окна и накопленные кеши (после ночи или холодного старта)."""
     WINDOWS.clear()
     LAST_VALTODAY.clear()
+    LAST_NUMTRADES.clear()
+    LAST_PRICES.clear()
     # SHORTNAMES не чистим (имена не меняются), COOLDOWNS истекают по времени.
 
 
@@ -102,18 +117,21 @@ def reset_state() -> None:
 # API
 # ============================================================================
 
-def fetch_snapshot() -> Optional[Tuple[Dict[str, str], Dict[str, float], Dict[str, dict]]]:
-    """Один запрос на всю биржу: имена, VALTODAY и дневная картина по каждому тикеру.
+def fetch_snapshot() -> Optional[Tuple[
+    Dict[str, str], Dict[str, float], Dict[str, int], Dict[str, dict]
+]]:
+    """Один запрос на всю биржу: имена, VALTODAY, NUMTRADES и дневная картина.
 
-    Возвращает (shortnames, valtoday, daily), где daily[ticker] = {
+    Возвращает (shortnames, valtoday, numtrades, daily), где daily[ticker] = {
         last, open, low, high, last_to_prev (%), valtoday
-    }. Поля могут быть None если данных нет (например, по неактивной доске).
+    }. Поля могут быть None если данных нет.
     """
     params = {
         "iss.meta": "off",
         "iss.only": "securities,marketdata",
         "securities.columns": "SECID,SHORTNAME,BOARDID",
-        "marketdata.columns": "SECID,BOARDID,VALTODAY,LAST,OPEN,LOW,HIGH,LASTTOPREVPRICE",
+        "marketdata.columns":
+            "SECID,BOARDID,VALTODAY,NUMTRADES,LAST,OPEN,LOW,HIGH,LASTTOPREVPRICE",
     }
     try:
         r = requests.get(SNAPSHOT_URL, params=params, timeout=HTTP_TIMEOUT)
@@ -128,11 +146,14 @@ def fetch_snapshot() -> Optional[Tuple[Dict[str, str], Dict[str, float], Dict[st
         shortnames.setdefault(secid, shortname)
 
     valtoday: Dict[str, float] = {}
+    numtrades: Dict[str, int] = {}
     daily: Dict[str, dict] = {}
-    for secid, _board, val, last, open_, low, high, last_to_prev in \
+    for secid, _board, val, ntr, last, open_, low, high, last_to_prev in \
             data.get("marketdata", {}).get("data", []):
         if val is not None:
             valtoday[secid] = valtoday.get(secid, 0.0) + float(val)
+        if ntr is not None:
+            numtrades[secid] = numtrades.get(secid, 0) + int(ntr)
         # Первая строка с непустым LAST — берём её как «основную» для дневной картины.
         if secid not in daily and last is not None:
             daily[secid] = {
@@ -143,12 +164,11 @@ def fetch_snapshot() -> Optional[Tuple[Dict[str, str], Dict[str, float], Dict[st
                 "last_to_prev": float(last_to_prev) if last_to_prev is not None else None,
             }
 
-    # Достроить VALTODAY в daily (после агрегации по всем доскам).
     for ticker, vt in valtoday.items():
         if ticker in daily:
             daily[ticker]["valtoday"] = vt
 
-    return shortnames, valtoday, daily
+    return shortnames, valtoday, numtrades, daily
 
 
 def fetch_index_context() -> Optional[float]:
@@ -299,6 +319,101 @@ def detect_anomalies(deltas: Dict[str, float]) -> list:
     return anomalies
 
 
+def compute_numtrades_deltas(numtrades: Dict[str, int]) -> Dict[str, int]:
+    """Дельта количества сделок за минуту. Обновляет кеш LAST_NUMTRADES."""
+    deltas: Dict[str, int] = {}
+    for ticker, val in numtrades.items():
+        prev = LAST_NUMTRADES.get(ticker)
+        LAST_NUMTRADES[ticker] = val
+        if prev is None or val < prev:
+            continue
+        deltas[ticker] = val - prev
+    return deltas
+
+
+def compute_price_changes(daily: Dict[str, dict]) -> Dict[str, Tuple[float, float]]:
+    """Минутное изменение цены: {ticker: (prev_last, new_last_change_pct)}.
+
+    Обновляет кеш LAST_PRICES. Возвращает только тикеры, у которых есть и prev и new.
+    """
+    changes: Dict[str, Tuple[float, float]] = {}
+    for ticker, info in daily.items():
+        new_last = info.get("last")
+        if new_last is None:
+            continue
+        prev = LAST_PRICES.get(ticker)
+        LAST_PRICES[ticker] = float(new_last)
+        if prev is None or prev <= 0:
+            continue
+        change_pct = (new_last - prev) / prev * 100
+        changes[ticker] = (prev, change_pct)
+    return changes
+
+
+def detect_block_trades(
+    deltas: Dict[str, float],
+    trade_deltas: Dict[str, int],
+    daily: Dict[str, dict],
+) -> list:
+    """Block trade: мало сделок в минуту, но крупный оборот → средняя сделка огромная."""
+    out = []
+    for ticker, dv in deltas.items():
+        if dv < BLOCK_MIN_MINUTE_VALUE:
+            continue
+        shortname = SHORTNAMES.get(ticker, "")
+        if is_excluded(ticker, shortname):
+            continue
+        dt = trade_deltas.get(ticker)
+        if not dt or dt <= 0:
+            continue
+        avg_size = dv / dt
+        if avg_size < BLOCK_MIN_AVG_TRADE_SIZE:
+            continue
+        out.append((ticker, {
+            "shortname": shortname,
+            "delta": dv,
+            "trades_count": dt,
+            "avg_trade_size": avg_size,
+        }))
+    out.sort(key=lambda x: x[1]["avg_trade_size"], reverse=True)
+    return out
+
+
+def detect_price_spikes(
+    deltas: Dict[str, float],
+    price_changes: Dict[str, Tuple[float, float]],
+) -> list:
+    """Price spike: цена двинулась на ≥ N% при обычном/малом объёме."""
+    out = []
+    for ticker, (prev_price, change_pct) in price_changes.items():
+        if abs(change_pct) < SPIKE_MIN_PRICE_PCT:
+            continue
+        shortname = SHORTNAMES.get(ticker, "")
+        if is_excluded(ticker, shortname):
+            continue
+        dv = deltas.get(ticker, 0.0)
+        if dv < SPIKE_MIN_DELTA_VAL:
+            continue
+        # Если объём уже выше порога volume anomaly — не дублируем spike.
+        window = WINDOWS.get(ticker)
+        if window and len(window) >= MIN_POINTS_FOR_STATS:
+            base = list(window)[:-1]
+            if base:
+                mean = statistics.mean(base)
+                if mean > 0 and dv / mean > SPIKE_MAX_DELTA_VS_MEAN:
+                    continue
+        new_price = LAST_PRICES.get(ticker, prev_price)
+        out.append((ticker, {
+            "shortname": shortname,
+            "prev_price": prev_price,
+            "new_price": new_price,
+            "change_pct": change_pct,
+            "delta": dv,
+        }))
+    out.sort(key=lambda x: abs(x[1]["change_pct"]), reverse=True)
+    return out
+
+
 def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
     """Разложить сделки тикера за последнюю минуту на buy/sell + топ-3 по обороту."""
     if not trades:
@@ -341,6 +456,17 @@ def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
 # TELEGRAM
 # ============================================================================
 
+def _direction_emoji(daily: Optional[dict], fallback_pct: Optional[float]) -> str:
+    direction = None
+    if daily and daily.get("last_to_prev") is not None:
+        direction = daily["last_to_prev"]
+    elif fallback_pct is not None:
+        direction = fallback_pct
+    if direction is None:
+        return "📊"
+    return "🟩 📈" if direction > 0 else "🟥 📉"
+
+
 def format_alert(
     ticker: str,
     info: dict,
@@ -348,31 +474,38 @@ def format_alert(
     daily: Optional[dict],
     market_change_pct: Optional[float],
     orderbook: Optional[dict],
+    kind: str = "volume",
 ) -> str:
-    multiplier = info["delta"] / info["mean"] if info["mean"] > 0 else 0
     shortname = html.escape(info["shortname"])
 
-    # Цвет шапки = дневной импульс тикера (LASTTOPREVPRICE) если есть,
-    # иначе откатываемся на минутный price_change.
-    direction = None
-    if daily and daily.get("last_to_prev") is not None:
-        direction = daily["last_to_prev"]
-    elif details and details.get("price_change_pct") is not None:
-        direction = details["price_change_pct"]
+    fallback = details.get("price_change_pct") if details else None
+    head_color = _direction_emoji(daily, fallback)
 
-    if direction is None:
-        head_emoji = "📊"
-    elif direction > 0:
-        head_emoji = "🟩 📈"
+    if kind == "block":
+        head = f"{head_color} 🧱 <b>{html.escape(ticker)}</b> — {shortname} · block trade"
+        body = [
+            f"Средняя сделка: <b>{format_number(info['avg_trade_size'])} руб</b>",
+            f"Оборот за минуту: {format_number(info['delta'])} руб "
+            f"({info['trades_count']} сделок)",
+        ]
+    elif kind == "spike":
+        arrow = "⬆️" if info["change_pct"] > 0 else "⬇️"
+        head = f"{head_color} ⚡ <b>{html.escape(ticker)}</b> — {shortname} · price spike"
+        body = [
+            f"Цена: {info['prev_price']:.2f} → <b>{info['new_price']:.2f}</b> "
+            f"{arrow} ({info['change_pct']:+.2f}% за мин)",
+            f"Оборот за минуту: {format_number(info['delta'])} руб",
+        ]
     else:
-        head_emoji = "🟥 📉"
+        multiplier = info["delta"] / info["mean"] if info["mean"] > 0 else 0
+        head = f"{head_color} <b>{html.escape(ticker)}</b> — {shortname}"
+        body = [
+            f"Оборот за минуту: <b>{format_number(info['delta'])} руб</b> "
+            f"(×{multiplier:.1f} от среднего)",
+            f"Z-score: +{info['z']:.1f} | окно {info['window_size']} мин",
+        ]
 
-    lines = [
-        f"{head_emoji} <b>{html.escape(ticker)}</b> — {shortname}",
-        f"Оборот за минуту: <b>{format_number(info['delta'])} руб</b> "
-        f"(×{multiplier:.1f} от среднего)",
-        f"Z-score: +{info['z']:.1f} | окно {info['window_size']} мин",
-    ]
+    lines = [head] + body
 
     # Дневная картина: LAST, изменение от пред. закрытия, диапазон, общий оборот.
     if daily:
@@ -468,46 +601,91 @@ def tick() -> None:
     snapshot = fetch_snapshot()
     if snapshot is None:
         return
-    shortnames, valtoday, daily = snapshot
+    shortnames, valtoday, numtrades, daily = snapshot
 
     SHORTNAMES.update(shortnames)
     deltas = update_windows(valtoday)
-    anomalies = detect_anomalies(deltas)
+    trade_deltas = compute_numtrades_deltas(numtrades)
+    price_changes = compute_price_changes(daily)
 
+    anomalies = detect_anomalies(deltas)
+    block_trades = detect_block_trades(deltas, trade_deltas, daily)
+    spikes = detect_price_spikes(deltas, price_changes)
+
+    # Один тикер может попасть и в volume, и в block, и в spike одновременно —
+    # отдаём приоритет volume, чтобы не дублировать.
+    blocked_tickers = {t for t, _ in anomalies}
+    block_trades = [(t, i) for t, i in block_trades if t not in blocked_tickers]
+    seen_block = blocked_tickers | {t for t, _ in block_trades}
+    spikes = [(t, i) for t, i in spikes if t not in seen_block]
+
+    parts = []
     if anomalies:
-        summary = ", ".join(
-            f"{t}(z={i['z']:.1f},+{i['deviation']:.0f}%)" for t, i in anomalies
-        )
-        log(f"snapshot OK {len(valtoday)} tickers · anomalies: {summary}")
+        parts.append("volume: " + ", ".join(
+            f"{t}(z={i['z']:.1f})" for t, i in anomalies))
+    if block_trades:
+        parts.append("block: " + ", ".join(
+            f"{t}(avg={format_number(i['avg_trade_size'])})"
+            for t, i in block_trades))
+    if spikes:
+        parts.append("spike: " + ", ".join(
+            f"{t}({i['change_pct']:+.2f}%)" for t, i in spikes))
+    if parts:
+        log(f"snapshot OK {len(valtoday)} tickers · " + " | ".join(parts))
     else:
         log(f"snapshot OK {len(valtoday)} tickers · no anomalies")
 
-    if not anomalies:
+    if not (anomalies or block_trades or spikes):
         return
 
-    # IMOEX тянем один раз на тик (только если есть что слать).
     market_change_pct = fetch_index_context()
-
     now = datetime.now()
-    for ticker, info in anomalies:
-        if COOLDOWNS.get(ticker, datetime.min) > now:
-            continue
-        trades = fetch_ticker_trades(ticker)
-        details = analyze_ticker_trades(trades, since=now - timedelta(minutes=1))
-        orderbook = fetch_orderbook(ticker)
+
+    def maybe_send(kind: str, ticker: str, info: dict, *, fetch_extras: bool) -> None:
+        if COOLDOWNS.get((kind, ticker), datetime.min) > now:
+            return
+        details = None
+        orderbook = None
+        if fetch_extras:
+            trades = fetch_ticker_trades(ticker)
+            details = analyze_ticker_trades(trades, since=now - timedelta(minutes=1))
+            orderbook = fetch_orderbook(ticker)
         msg = format_alert(
             ticker, info, details,
             daily.get(ticker), market_change_pct, orderbook,
+            kind=kind,
         )
         if send_telegram(msg):
-            COOLDOWNS[ticker] = now + timedelta(minutes=COOLDOWN_MINUTES)
-            log(f"alert sent: {ticker}")
+            COOLDOWNS[(kind, ticker)] = now + timedelta(minutes=COOLDOWN_MINUTES)
+            log(f"alert sent: {kind}/{ticker}")
+
+    for ticker, info in anomalies:
+        maybe_send("volume", ticker, info, fetch_extras=True)
+    for ticker, info in block_trades:
+        # У block trade сделок единицы — лезть в /trades.json и /orderbook.json смысла мало.
+        maybe_send("block", ticker, info, fetch_extras=False)
+    for ticker, info in spikes:
+        # Для spike стакан полезен (увидеть тонкое место), trades — нет.
+        if COOLDOWNS.get(("spike", ticker), datetime.min) > now:
+            continue
+        orderbook = fetch_orderbook(ticker)
+        msg = format_alert(
+            ticker, info, None,
+            daily.get(ticker), market_change_pct, orderbook,
+            kind="spike",
+        )
+        if send_telegram(msg):
+            COOLDOWNS[("spike", ticker)] = now + timedelta(minutes=COOLDOWN_MINUTES)
+            log(f"alert sent: spike/{ticker}")
 
 
 def main() -> None:
     log("MOEX intraday monitor started")
-    log(f"thresholds: z>{ANOMALY_THRESHOLD_SIGMA}, dev>{MIN_DEVIATION_PERCENT}%, "
+    log(f"volume: z>{ANOMALY_THRESHOLD_SIGMA}, dev>{MIN_DEVIATION_PERCENT}%, "
         f"mean>={format_number(MIN_AVG_MINUTE_VALUE)}/мин")
+    log(f"block: val>={format_number(BLOCK_MIN_MINUTE_VALUE)}, "
+        f"avg>={format_number(BLOCK_MIN_AVG_TRADE_SIZE)}/сделка")
+    log(f"spike: |Δp|>={SPIKE_MIN_PRICE_PCT}% за мин, val>={format_number(SPIKE_MIN_DELTA_VAL)}")
     log(f"window: {WINDOW_MINUTES} min · cooldown: {COOLDOWN_MINUTES} min")
     log("sleep window: 23:50–06:50 MSK")
 

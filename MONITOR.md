@@ -14,39 +14,62 @@
 | Источник            | `/iss/history/...` (закрытый день)| `/iss/.../securities.json` (snapshot) |
 | Частота             | 1 раз в день по cron              | 1 раз в минуту                        |
 | База сравнения      | 5 предыдущих торговых дней        | Скользящее окно 30 минут той же сессии|
-| Разделение buy/sell | Нет                               | Да, по `/trades.json` для аномалии    |
+| Сигналы             | Объём                             | Volume + block trade + price spike    |
+| Разделение buy/sell | Нет                               | Да, по `/trades.json` для volume      |
 | Деплой              | Docker / Coolify                  | systemd на linux-сервере              |
 | Telegram            | `notify.py` (без прокси)          | `monitor.py` (с поддержкой прокси)    |
 
 ## Как работает алгоритм
 
-Каждую минуту:
+Каждую минуту делается один лёгкий запрос на всю биржу:
+`GET /iss/engines/stock/markets/shares/securities.json` с фильтром
+`iss.only=securities,marketdata`. В ответе — `SECID`, `SHORTNAME`,
+`VALTODAY`, `NUMTRADES`, `LAST`, `OPEN`, `LOW`, `HIGH`, `LASTTOPREVPRICE`
+для всех ~500 инструментов.
 
-1. **Один лёгкий запрос на всю биржу:**
-   `GET /iss/engines/stock/markets/shares/securities.json` с фильтром
-   `iss.only=securities,marketdata`. В ответе — `SECID`, `SHORTNAME`,
-   `VALTODAY` (накопленный с открытия оборот) для всех ~250 акций.
+Из этого считаются три независимых сигнала.
 
-2. **Дельта** = `VALTODAY_сейчас − VALTODAY_прошлая_минута`. Это оборот за
-   последнюю минуту.
+### 1. Volume anomaly — повышенный оборот
 
-3. **Скользящее окно** последних 30 минут (per ticker). Считаем mean и stdev
-   по окну **без текущей точки**.
+- Дельта = `VALTODAY_сейчас − VALTODAY_прошлая_минута`
+- Скользящее окно последних 30 минут (per ticker), mean/stdev по окну
+  **без текущей точки**
+- Триггер (все три условия):
+  - `z-score > ANOMALY_THRESHOLD_SIGMA` (по умолчанию 5.0)
+  - `deviation > MIN_DEVIATION_PERCENT` (по умолчанию 500%)
+  - `mean >= MIN_AVG_MINUTE_VALUE` (по умолчанию 200 тыс руб/мин)
+- При срабатывании — +1 запрос `/trades.json` и +1 `/orderbook.json` для
+  обогащения алерта buy/sell, топ-3 сделками и стаканом.
 
-4. **Аномалия** срабатывает, если выполнены **все три** условия:
-   - `z-score > ANOMALY_THRESHOLD_SIGMA` (по умолчанию 5.0)
-   - `deviation > MIN_DEVIATION_PERCENT` (по умолчанию 500%)
-   - `mean >= MIN_AVG_MINUTE_VALUE` (по умолчанию 200 тыс руб/мин — отсекает неликвид)
+### 2. Block trade — одна крупная сделка
 
-5. **При аномалии — углублённый запрос** по конкретному тикеру:
-   `GET /iss/.../securities/<TICKER>/trades.json`. Разбираем сделки за
-   последнюю минуту:
-   - Сумма покупок (`BUYSELL=B`) vs продаж (`BUYSELL=S`)
-   - Изменение цены за минуту
-   - Топ-сделка по объёму
+- Дельта `NUMTRADES` за минуту → средний размер сделки
+  `delta_VALTODAY / delta_NUMTRADES`
+- Триггер (оба условия):
+  - `delta_VALTODAY ≥ BLOCK_MIN_MINUTE_VALUE` (по умолчанию 5 млн руб)
+  - `средний размер сделки ≥ BLOCK_MIN_AVG_TRADE_SIZE` (по умолчанию 2 млн)
+- Дополнительных запросов нет — данные уже в snapshot.
 
-6. **Telegram-алерт** в канал с детализацией. Кулдаун на тикер — 30 минут,
-   чтобы не спамить.
+### 3. Price spike — резкое движение цены при обычном/малом объёме
+
+- Дельта `LAST` за минуту в процентах
+- Триггер (все три условия):
+  - `|Δp| ≥ SPIKE_MIN_PRICE_PCT` (по умолчанию 1%)
+  - `delta_VALTODAY ≥ SPIKE_MIN_DELTA_VAL` (по умолчанию 50 тыс — хоть что-то торговалось)
+  - оборот **не** превышает `SPIKE_MAX_DELTA_VS_MEAN × mean` (иначе это уже volume anomaly)
+- При срабатывании — +1 запрос `/orderbook.json`, чтобы увидеть тонкое место.
+
+### Приоритет и кулдауны
+
+Если по тикеру одновременно сработали volume + block + spike — отдаётся
+приоритет volume, потом block, потом spike (без дубля). Кулдаун **30 минут
+на (тип, тикер)**, т.е. volume и spike по одному тикеру не блокируют друг
+друга, если разнесены по времени.
+
+### IMOEX-контекст
+
+При наличии любого алерта в тике подгружается `LASTCHANGEPRC` индекса
+IMOEX (1 запрос на тик, не на тикер), чтобы видеть рынок-контекст.
 
 ## Окно сна 23:50–06:50 MSK
 
@@ -64,14 +87,25 @@
 Все параметры — в начале `monitor.py`:
 
 ```python
-ANOMALY_THRESHOLD_SIGMA = 5.0
-MIN_DEVIATION_PERCENT   = 500
-MIN_AVG_MINUTE_VALUE    = 200_000  # руб/мин
-WINDOW_MINUTES          = 30
-MIN_POINTS_FOR_STATS    = 10
-COOLDOWN_MINUTES        = 30
-SLEEP_START_MIN         = 23 * 60 + 50
-SLEEP_END_MIN           = 6  * 60 + 50
+# volume anomaly
+ANOMALY_THRESHOLD_SIGMA   = 5.0
+MIN_DEVIATION_PERCENT     = 500
+MIN_AVG_MINUTE_VALUE      = 200_000      # руб/мин
+WINDOW_MINUTES            = 30
+MIN_POINTS_FOR_STATS      = 10
+
+# block trade
+BLOCK_MIN_MINUTE_VALUE    = 5_000_000    # руб
+BLOCK_MIN_AVG_TRADE_SIZE  = 2_000_000    # руб/сделка
+
+# price spike
+SPIKE_MIN_PRICE_PCT       = 1.0          # %
+SPIKE_MIN_DELTA_VAL       = 50_000       # руб
+SPIKE_MAX_DELTA_VS_MEAN   = 3.0          # × от mean окна
+
+COOLDOWN_MINUTES          = 30           # на (kind, ticker)
+SLEEP_START_MIN           = 23 * 60 + 50
+SLEEP_END_MIN             = 6  * 60 + 50
 ```
 
 После изменения — `systemctl restart imoex-monitor`.
@@ -137,9 +171,11 @@ cd /opt/imoex-anomaly && git pull && systemctl restart imoex-monitor
 Норма:
 
 ```
-[12:34:00] snapshot OK 243 tickers · no anomalies
-[12:35:00] snapshot OK 243 tickers · anomalies: SBER(z=8.4,+730%)
-[12:35:01] alert sent: SBER
+[12:34:00] snapshot OK 487 tickers · no anomalies
+[12:35:00] snapshot OK 487 tickers · volume: SBER(z=8.4) | block: GAZP(avg=4.1 млн) | spike: AFLT(+1.4%)
+[12:35:01] alert sent: volume/SBER
+[12:35:02] alert sent: block/GAZP
+[12:35:02] alert sent: spike/AFLT
 ```
 
 Проблемы:
