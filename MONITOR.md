@@ -36,7 +36,7 @@
 4. **Аномалия** срабатывает, если выполнены **все три** условия:
    - `z-score > ANOMALY_THRESHOLD_SIGMA` (по умолчанию 5.0)
    - `deviation > MIN_DEVIATION_PERCENT` (по умолчанию 500%)
-   - `mean >= MIN_AVG_MINUTE_VALUE` (по умолчанию 1 млн руб/мин — отсекает неликвид)
+   - `mean >= MIN_AVG_MINUTE_VALUE` (по умолчанию 200 тыс руб/мин — отсекает неликвид)
 
 5. **При аномалии — углублённый запрос** по конкретному тикеру:
    `GET /iss/.../securities/<TICKER>/trades.json`. Разбираем сделки за
@@ -66,7 +66,7 @@
 ```python
 ANOMALY_THRESHOLD_SIGMA = 5.0
 MIN_DEVIATION_PERCENT   = 500
-MIN_AVG_MINUTE_VALUE    = 1_000_000  # руб/мин
+MIN_AVG_MINUTE_VALUE    = 200_000  # руб/мин
 WINDOW_MINUTES          = 30
 MIN_POINTS_FOR_STATS    = 10
 COOLDOWN_MINUTES        = 30
