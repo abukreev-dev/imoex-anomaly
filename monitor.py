@@ -6,6 +6,7 @@ import os
 import statistics
 import sys
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -717,6 +718,7 @@ def main() -> None:
             return
         except Exception as e:
             log(f"unexpected error: {type(e).__name__}: {e}")
+            log("traceback:\n" + traceback.format_exc())
             time.sleep(10)
 
 
