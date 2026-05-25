@@ -81,6 +81,16 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def format_price(p: float) -> str:
+    """Адаптивная точность: копеечные бумаги показываем с 4 знаками."""
+    ap = abs(p)
+    if ap < 1:
+        return f"{p:.4f}"
+    if ap < 10:
+        return f"{p:.3f}"
+    return f"{p:.2f}"
+
+
 def format_number(num: float) -> str:
     if num >= 1_000_000_000:
         return f"{num / 1_000_000_000:.1f} млрд"
@@ -477,8 +487,12 @@ def format_alert(
 ) -> str:
     shortname = html.escape(info["shortname"])
 
-    fallback = details.get("price_change_pct") if details else None
-    head_color = _direction_emoji(daily, fallback)
+    if kind == "spike":
+        # Для spike цвет шапки = минутное движение (само событие), а не дневной импульс.
+        head_color = _direction_emoji(None, info["change_pct"])
+    else:
+        fallback = details.get("price_change_pct") if details else None
+        head_color = _direction_emoji(daily, fallback)
 
     if kind == "block":
         head = f"{head_color} 🧱 <b>{html.escape(ticker)}</b> — {shortname} · block trade"
@@ -491,7 +505,8 @@ def format_alert(
         arrow = "⬆️" if info["change_pct"] > 0 else "⬇️"
         head = f"{head_color} ⚡ <b>{html.escape(ticker)}</b> — {shortname} · price spike"
         body = [
-            f"Цена: {info['prev_price']:.2f} → <b>{info['new_price']:.2f}</b> "
+            f"Цена: {format_price(info['prev_price'])} → "
+            f"<b>{format_price(info['new_price'])}</b> "
             f"{arrow} ({info['change_pct']:+.2f}% за мин)",
             f"Оборот за минуту: {format_number(info['delta'])} руб",
         ]
@@ -511,15 +526,15 @@ def format_alert(
         last = daily.get("last")
         ltp = daily.get("last_to_prev")
         if last is not None:
-            day_line = f"Цена: <b>{last:.2f}</b>"
+            day_line = f"Цена: <b>{format_price(last)}</b>"
             if ltp is not None:
                 day_line += f" ({ltp:+.2f}% к закр.)"
             lines.append(day_line)
         low, high, open_ = daily.get("low"), daily.get("high"), daily.get("open")
         if low is not None and high is not None:
-            range_line = f"День: мин {low:.2f} / макс {high:.2f}"
+            range_line = f"День: мин {format_price(low)} / макс {format_price(high)}"
             if open_ is not None:
-                range_line += f" · откр {open_:.2f}"
+                range_line += f" · откр {format_price(open_)}"
             lines.append(range_line)
         vt = daily.get("valtoday")
         if vt:
@@ -535,7 +550,7 @@ def format_alert(
         lines.append(f"Продажи: {details['sell_pct']:.0f}% "
                      f"({format_number(details['sell_value'])})")
         if details["price_last"] is not None and details["price_change_pct"] is not None:
-            lines.append(f"Минута: {details['price_last']:.2f} "
+            lines.append(f"Минута: {format_price(details['price_last'])} "
                          f"({details['price_change_pct']:+.2f}%)")
         lines.append(f"Сделок в минуту: {details['trades_count']}")
 
@@ -550,7 +565,7 @@ def format_alert(
                 qty = t.get("QUANTITY")
                 bits = [format_number(val) + " руб", side]
                 if price is not None and qty is not None:
-                    bits.append(f"{int(qty)}@{float(price):.2f}")
+                    bits.append(f"{int(qty)}@{format_price(float(price))}")
                 lines.append("• " + " · ".join(bits))
 
     if orderbook and (orderbook.get("bids") or orderbook.get("asks")):
@@ -560,9 +575,9 @@ def format_alert(
         bids = orderbook.get("bids") or []
         # Аски выводим сверху вниз (от худшей к лучшей), биды — от лучшей к худшей.
         for price, qty in reversed(asks):
-            lines.append(f"   ask {price:.2f} × {qty}")
+            lines.append(f"   ask {format_price(price)} × {qty}")
         for price, qty in bids:
-            lines.append(f"   bid {price:.2f} × {qty}")
+            lines.append(f"   bid {format_price(price)} × {qty}")
 
     lines.append("")
     lines.append(f'<a href="{MOEX_PAGE_URL_TPL.format(ticker=html.escape(ticker))}">'
