@@ -173,23 +173,21 @@ def fetch_snapshot() -> Optional[Tuple[
 
 
 def fetch_index_context() -> Optional[float]:
-    """Изменение IMOEX за день в %. None если не удалось получить."""
+    """Изменение IMOEX за день в %. None при любой ошибке — не должно валить tick()."""
     params = {
         "iss.meta": "off",
-        "iss.only": "securities",
-        "securities.columns": "SECID,LASTCHANGEPRC",
+        "iss.only": "marketdata",
+        "marketdata.columns": "SECID,LASTCHANGEPRC",
     }
     try:
         r = requests.get(INDEX_URL, params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-    except (requests.RequestException, ValueError) as e:
+        for row in data.get("marketdata", {}).get("data", []):
+            if len(row) >= 2 and row[0] == "IMOEX" and row[1] is not None:
+                return float(row[1])
+    except Exception as e:
         log(f"index error: {e}")
-        return None
-
-    for row in data.get("securities", {}).get("data", []):
-        if row and row[0] == "IMOEX" and row[1] is not None:
-            return float(row[1])
     return None
 
 
