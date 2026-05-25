@@ -517,17 +517,16 @@ def format_alert(
             lines.append(day_line)
         low, high, open_ = daily.get("low"), daily.get("high"), daily.get("open")
         if low is not None and high is not None:
-            range_line = f"День: L {low:.2f} / H {high:.2f}"
+            range_line = f"День: мин {low:.2f} / макс {high:.2f}"
             if open_ is not None:
-                range_line += f" · O {open_:.2f}"
+                range_line += f" · откр {open_:.2f}"
             lines.append(range_line)
         vt = daily.get("valtoday")
         if vt:
             lines.append(f"Оборот за день: {format_number(vt)} руб")
 
     if market_change_pct is not None:
-        m_emoji = "🟢" if market_change_pct >= 0 else "🔴"
-        lines.append(f"IMOEX: {m_emoji} {market_change_pct:+.2f}%")
+        lines.append(f"IMOEX: {market_change_pct:+.2f}%")
 
     if details:
         lines.append("")
