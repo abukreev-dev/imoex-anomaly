@@ -183,7 +183,11 @@ def fetch_snapshot() -> Optional[Tuple[
 
 
 def fetch_index_context() -> Optional[float]:
-    """Изменение IMOEX за день в %. None при любой ошибке — не должно валить tick()."""
+    """Изменение индекса за день в %. None при любой ошибке.
+
+    Берём IMOEX2: днём он совпадает с IMOEX, а в вечернюю сессию (после 19:00)
+    продолжает обновляться, тогда как IMOEX замирает на закрытии основной сессии.
+    """
     params = {
         "iss.meta": "off",
         "iss.only": "marketdata",
@@ -194,7 +198,7 @@ def fetch_index_context() -> Optional[float]:
         r.raise_for_status()
         data = r.json()
         for row in data.get("marketdata", {}).get("data", []):
-            if len(row) >= 2 and row[0] == "IMOEX" and row[1] is not None:
+            if len(row) >= 2 and row[0] == "IMOEX2" and row[1] is not None:
                 return float(row[1])
     except Exception as e:
         log(f"index error: {e}")
