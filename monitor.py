@@ -492,11 +492,18 @@ def format_alert(
     shortname = html.escape(info["shortname"])
 
     if kind == "spike":
-        # Для spike цвет шапки = минутное движение (само событие), а не дневной импульс.
+        # Для spike цвет шапки = минутное движение (само событие).
         head_color = _direction_emoji(None, info["change_pct"])
+    elif kind == "volume":
+        # Для volume — приоритет минутному движению аномалии, fallback на дневной импульс.
+        minute_change = details.get("price_change_pct") if details else None
+        if minute_change is not None:
+            head_color = _direction_emoji(None, minute_change)
+        else:
+            head_color = _direction_emoji(daily, None)
     else:
-        fallback = details.get("price_change_pct") if details else None
-        head_color = _direction_emoji(daily, fallback)
+        # block — дневной импульс (минутного движения у block нет).
+        head_color = _direction_emoji(daily, None)
 
     if kind == "block":
         head = f"{head_color} 🧱 <b>{html.escape(ticker)}</b> — {shortname} · block trade"
