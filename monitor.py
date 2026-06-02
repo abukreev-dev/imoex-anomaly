@@ -164,17 +164,23 @@ def fetch_snapshot() -> Optional[Tuple[
     for secid, shortname, _board in data.get("securities", {}).get("data", []):
         shortnames.setdefault(secid, shortname)
 
+    # Берём только основной режим TQBR. Параллельные режимы (SMAL — лот=1 шт.,
+    # SPEQ и т.п.) имеют свои LAST/HIGH/LOW и крошечный оборот: одна сделка по
+    # «нерыночной» цене на SMAL ловилась как spike, хотя на TQBR (главный график)
+    # цена туда не ходила. См. GAZP 2026-06-02: SMAL LAST=117.19/HIGH=118.82
+    # против TQBR LAST=116.30/HIGH=116.38 при обороте SMAL 6.5 тыс ₽ за день.
     valtoday: Dict[str, float] = {}
     numtrades: Dict[str, int] = {}
     daily: Dict[str, dict] = {}
-    for secid, _board, val, ntr, last, open_, low, high, last_to_prev in \
+    for secid, board, val, ntr, last, open_, low, high, last_to_prev in \
             data.get("marketdata", {}).get("data", []):
+        if board != "TQBR":
+            continue
         if val is not None:
-            valtoday[secid] = valtoday.get(secid, 0.0) + float(val)
+            valtoday[secid] = float(val)
         if ntr is not None:
-            numtrades[secid] = numtrades.get(secid, 0) + int(ntr)
-        # Первая строка с непустым LAST — берём её как «основную» для дневной картины.
-        if secid not in daily and last is not None:
+            numtrades[secid] = int(ntr)
+        if last is not None:
             daily[secid] = {
                 "last": float(last),
                 "open": float(open_) if open_ is not None else None,
