@@ -21,6 +21,8 @@ except ImportError:
     print("Требуется requests: pip install requests", file=sys.stderr)
     sys.exit(1)
 
+import signal_log
+
 # ============================================================================
 # НАСТРОЙКИ
 # ============================================================================
@@ -507,6 +509,21 @@ def _direction_emoji(daily: Optional[dict], fallback_pct: Optional[float]) -> st
     return "🟩 📈" if direction > 0 else "🟥 📉"
 
 
+def _signal_direction(kind: str, info: dict, details: Optional[dict], daily: Optional[dict]) -> str:
+    """Та же логика знака, что и у _direction_emoji, но как строка для лога."""
+    if kind == "spike":
+        pct = info["change_pct"]
+    elif kind == "volume":
+        pct = details.get("price_change_pct") if details else None
+        if pct is None:
+            pct = daily.get("last_to_prev") if daily else None
+    else:  # block
+        pct = daily.get("last_to_prev") if daily else None
+    if pct is None:
+        return "unknown"
+    return "up" if pct > 0 else "down" if pct < 0 else "flat"
+
+
 def format_alert(
     ticker: str,
     info: dict,
@@ -659,6 +676,8 @@ def tick() -> None:
     trade_deltas = compute_numtrades_deltas(numtrades)
     price_changes = compute_price_changes(daily)
 
+    signal_log.update_forward_returns(LAST_PRICES, datetime.now())
+
     anomalies = detect_anomalies(deltas)
     block_trades = detect_block_trades(deltas, trade_deltas, daily)
     spikes = detect_price_spikes(deltas, price_changes)
@@ -704,9 +723,10 @@ def tick() -> None:
             trades = fetch_ticker_trades(ticker)
             details = analyze_ticker_trades(trades, since=now - timedelta(minutes=1))
             orderbook = fetch_orderbook(ticker)
+        ticker_daily = daily.get(ticker)
         msg = format_alert(
             ticker, info, details,
-            daily.get(ticker), market_change_pct, orderbook,
+            ticker_daily, market_change_pct, orderbook,
             kind=kind,
         )
         if send_telegram(msg):
@@ -714,6 +734,21 @@ def tick() -> None:
             cd_until = (frozen[2] if in_wave else now) + timedelta(minutes=COOLDOWN_MINUTES)
             COOLDOWNS[(kind, ticker)] = cd_until
             log(f"alert sent: {kind}/{ticker}")
+            metric_name, metric_value = (
+                ("z_score", info["z"]) if kind == "volume"
+                else ("avg_trade_size", info["avg_trade_size"])
+            )
+            signal_log.log_signal(
+                kind=kind,
+                ticker=ticker,
+                shortname=info["shortname"],
+                price=ticker_daily.get("last") if ticker_daily else None,
+                metric_name=metric_name,
+                metric_value=metric_value,
+                direction=_signal_direction(kind, info, details, ticker_daily),
+                market_change_pct=market_change_pct,
+                now=now,
+            )
 
     for ticker, info in anomalies:
         maybe_send("volume", ticker, info, fetch_extras=True)
@@ -725,14 +760,26 @@ def tick() -> None:
         if COOLDOWNS.get(("spike", ticker), datetime.min) > now:
             continue
         orderbook = fetch_orderbook(ticker)
+        ticker_daily = daily.get(ticker)
         msg = format_alert(
             ticker, info, None,
-            daily.get(ticker), market_change_pct, orderbook,
+            ticker_daily, market_change_pct, orderbook,
             kind="spike",
         )
         if send_telegram(msg):
             COOLDOWNS[("spike", ticker)] = now + timedelta(minutes=COOLDOWN_MINUTES)
             log(f"alert sent: spike/{ticker}")
+            signal_log.log_signal(
+                kind="spike",
+                ticker=ticker,
+                shortname=info["shortname"],
+                price=info["new_price"],
+                metric_name="change_pct",
+                metric_value=info["change_pct"],
+                direction=_signal_direction("spike", info, None, ticker_daily),
+                market_change_pct=market_change_pct,
+                now=now,
+            )
 
 
 def main() -> None:
@@ -745,6 +792,7 @@ def main() -> None:
     log(f"window: {WINDOW_MINUTES} min · cooldown: {COOLDOWN_MINUTES} min")
     log("sleep window: 23:50–06:50 MSK")
 
+    signal_log.init_db()
     reset_state()
     sleeping = False
 
@@ -753,6 +801,7 @@ def main() -> None:
             if is_sleep_time():
                 if not sleeping:
                     log("entering night sleep window, resetting state")
+                    signal_log.finalize_eod(LAST_PRICES, datetime.now())
                     reset_state()
                     sleeping = True
                 time.sleep(60)
