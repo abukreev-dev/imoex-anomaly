@@ -41,6 +41,14 @@ EXCLUDED_TICKER_PREFIXES = ("RU000",)
 # Ключевые слова в названии для исключения (ETF и т.д.)
 EXCLUDED_SHORTNAME_KEYWORDS = ("ETF",)
 
+# Типы бумаг, которые считаем акциями: 1 — обыкновенная, 2 — привилегированная,
+# D — депозитарная расписка. Всё остальное (9/A/B — паи ЗПИФ/БПИФ, J — ETF)
+# отсекаем: у паёв цена приколочена маркетмейкером, оборот идёт блоками, и в
+# отчёт они попадают как «аномалия» с нулевым движением цены. Префикс RU000 и
+# слово ETF такие бумаги не ловят — тикеры XSECUR, XKLUCH, XSBORA выглядят
+# как обычные акции.
+ALLOWED_SECTYPES = ("1", "2", "D")
+
 # Параметры API
 MOEX_API_BASE = "https://iss.moex.com/iss"
 MAX_RETRIES = 5
@@ -148,6 +156,52 @@ def fetch_volumes_from_api(date: str) -> Dict:
                 raise Exception(f"Не удалось загрузить данные за {date}: {e}")
 
 
+_NON_EQUITY_CACHE: Optional[set] = None
+
+
+def fetch_non_equity_secids() -> set:
+    """Тикеры, которые ТОЧНО не акции — по справочнику инструментов.
+
+    Историческое API (`/history/...`) колонку SECTYPE не отдаёт, поэтому тип
+    бумаги приходится брать отдельным запросом к текущему справочнику.
+
+    Возвращаем именно «чёрный список», а не «белый»: справочник актуален на
+    сегодня, и бумага, делистингованная после анализируемой даты, в нём уже
+    отсутствует. По белому списку такая бумага молча выпала бы из отчёта, по
+    чёрному — остаётся: неизвестный тип не повод исключать.
+
+    При недоступности справочника возвращаем пустое множество — детектор
+    отработает по старым фильтрам, а не упадёт целиком.
+    """
+    global _NON_EQUITY_CACHE
+    if _NON_EQUITY_CACHE is not None:
+        return _NON_EQUITY_CACHE
+
+    url = f"{MOEX_API_BASE}/engines/stock/markets/shares/securities.json"
+    params = {
+        'iss.meta': 'off',
+        'iss.only': 'securities',
+        'securities.columns': 'SECID,SECTYPE',
+    }
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        block = response.json().get('securities', {})
+        columns = block.get('columns', [])
+        i_secid = columns.index('SECID')
+        i_sectype = columns.index('SECTYPE')
+        _NON_EQUITY_CACHE = {
+            row[i_secid] for row in block.get('data', [])
+            if row[i_sectype] not in ALLOWED_SECTYPES
+        }
+        print(f"  Справочник инструментов: не-акций {len(_NON_EQUITY_CACHE)}")
+    except Exception as e:
+        print(f"  ⚠ Справочник инструментов недоступен ({e}), фильтр по типу бумаги отключён")
+        _NON_EQUITY_CACHE = set()
+
+    return _NON_EQUITY_CACHE
+
+
 def aggregate_ticker_data(raw_data: List) -> Dict:
     """
     Агрегировать данные по тикерам (суммировать дубли из разных режимов торгов)
@@ -239,10 +293,15 @@ def calculate_statistics(base_data: List[Dict], target_data: Dict) -> Dict:
     """
     stats = {}
     warnings = []
+    non_equity = fetch_non_equity_secids()
 
     for ticker, target_info in target_data.items():
         # Пропускаем тикеры с исключенными префиксами
         if ticker.startswith(EXCLUDED_TICKER_PREFIXES):
+            continue
+
+        # Пропускаем всё, что не акция/расписка (паи ЗПИФ/БПИФ, ETF)
+        if ticker in non_equity:
             continue
 
         # Пропускаем тикеры с исключенными ключевыми словами в названии (ETF и т.д.)
