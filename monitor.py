@@ -21,7 +21,9 @@ except ImportError:
     print("Требуется requests: pip install requests", file=sys.stderr)
     sys.exit(1)
 
+import order_flow
 import signal_log
+import volume_profile
 
 # ============================================================================
 # НАСТРОЙКИ
@@ -29,7 +31,7 @@ import signal_log
 
 ANOMALY_THRESHOLD_SIGMA = 8.0
 MIN_DEVIATION_PERCENT = 500
-MIN_AVG_MINUTE_VALUE = 500_000  # руб/мин
+MIN_AVG_MINUTE_VALUE = 1_000_000  # руб/мин
 WINDOW_MINUTES = 30
 MIN_POINTS_FOR_STATS = 10
 COOLDOWN_MINUTES = 30
@@ -37,15 +39,31 @@ COOLDOWN_MINUTES = 30
 # После первого volume-алерта baseline (mean/std) замораживается на этот срок,
 # чтобы продолжать видеть волну, пока окно не «привыкло» к новому уровню.
 # Кулдаун в это время не блокирует — каждая аномальная минута идёт в чат.
-VOLUME_FREEZE_MINUTES = 10
+VOLUME_FREEZE_MINUTES = 5
 
-# Block trade: «одна большая сделка» детектится без trades.json через NUMTRADES.
-# Сигнал: в минуту прошло мало сделок, но оборот значимый → средняя сделка огромная.
-BLOCK_MIN_MINUTE_VALUE = 5_000_000      # руб, отсекаем мелкий шум
-BLOCK_MIN_AVG_TRADE_SIZE = 2_000_000    # руб/сделка средняя за эту минуту
+# Потолок volume-алертов по одной бумаге за торговый день. Замер по 6389
+# сигналам (31.07–24.08.2026) показал у volume нулевую прогностику на всех
+# горизонтах и на всех z — при 76% доли трафика канала. Резать по z бесполезно
+# (z=25 предсказывает ровно столько же, сколько z=8), поэтому режем поток:
+# волна SGZH 04.08.2026 дала 27 алертов за день, теперь даст не больше 3.
+MAX_VOLUME_ALERTS_PER_DAY = 3
+
+# Поток накапливается часами и, сработав, остаётся сработавшим — обычных
+# 30 минут мало, иначе одна и та же бумага уедет в канал двадцать раз за день.
+FLOW_COOLDOWN_MINUTES = 120
+
+# Big trade: настоящий фильтр по размеру ОДНОЙ сделки из ленты (не средней).
+# Кандидаты отбираются дёшево — принта на 30 млн не может быть в минуте,
+# где всего прошло меньше 30 млн, — и только по ним читается /trades.json.
+BIG_TRADE_MIN_VALUE = 30_000_000        # руб, размер одной сделки
+BIG_TRADE_MAX_CANDIDATES = 25           # потолок доп. запросов в минуту
 
 # Price spike: цена дёрнулась без сопоставимого объёма (тонкий стакан проткнули).
+# По статистике это разворотный сигнал: 77% спайков вверх откатывают, медиана
+# возврата к концу дня растёт монотонно с силой прокола (−0.57% на 1–1.5%,
+# −3.51% на 5%+). Сильным считаем от SPIKE_STRONG_PRICE_PCT.
 SPIKE_MIN_PRICE_PCT = 1.0               # |Δцены за минуту| ≥ 1%
+SPIKE_STRONG_PRICE_PCT = 2.0            # выше — разворот заметно надёжнее
 SPIKE_MIN_DELTA_VAL = 50_000            # руб, минимум — хоть что-то торговалось
 SPIKE_MAX_DELTA_VS_MEAN = 3.0           # выше — это уже volume anomaly, не spike
 
@@ -55,6 +73,15 @@ SLEEP_END_MIN = 6 * 60 + 50
 
 EXCLUDED_TICKER_PREFIXES = ("RU000",)
 EXCLUDED_SHORTNAME_KEYWORDS = ("ETF",)
+
+# Фильтр по типу инструмента. На TQBR помимо акций торгуются паи ЗПИФ/БПИФ
+# (SECTYPE A/B/9) и ETF (J) — у них маркетмейкерская цена, которая за день не
+# двигается, а оборот идёт редкими крупными блоками. Именно они давали 27 из 35
+# block-сигналов (XSECUR, XKLUCH, XSBORA, XFMAIN) с forward return ровно 0.00%.
+# Фильтрация по префиксу RU000 и слову ETF их не ловила: тикеры вида XSECUR
+# выглядят как обычные акции.
+#   1 — акция обыкновенная, 2 — привилегированная, D — депозитарная расписка.
+ALLOWED_SECTYPES = ("1", "2", "D")
 
 MOEX_API_BASE = "https://iss.moex.com/iss"
 SNAPSHOT_URL = f"{MOEX_API_BASE}/engines/stock/markets/shares/securities.json"
@@ -76,13 +103,17 @@ HTTP_TIMEOUT = 20
 
 WINDOWS: Dict[str, deque] = {}                 # {ticker: deque[delta_per_minute]}
 LAST_VALTODAY: Dict[str, float] = {}           # {ticker: VALTODAY на прошлом замере}
-LAST_NUMTRADES: Dict[str, int] = {}            # {ticker: NUMTRADES на прошлом замере}
 LAST_PRICES: Dict[str, float] = {}             # {ticker: LAST цена на прошлом замере}
 SHORTNAMES: Dict[str, str] = {}                # {ticker: shortname}
+EQUITIES: set = set()                          # тикеры с разрешённым SECTYPE
 # COOLDOWNS keyed by (kind, ticker) — у каждого типа алерта свой кулдаун.
 COOLDOWNS: Dict[Tuple[str, str], datetime] = {}
 # FROZEN_BASELINES[ticker] = (mean, std, expires_at) — заморозка для volume-волны.
 FROZEN_BASELINES: Dict[str, Tuple[float, float, datetime]] = {}
+# Счётчик volume-алертов за торговый день: {ticker: count}, сбрасывается на ночь.
+VOLUME_ALERTS_TODAY: Dict[str, int] = {}
+# Оборот тикера на момент прошлого захода order_flow — для дельты за интервал.
+FLOW_LAST_VALTODAY: Dict[str, float] = {}
 
 
 def log(msg: str) -> None:
@@ -111,6 +142,10 @@ def format_number(num: float) -> str:
 
 
 def is_excluded(secid: str, shortname: str) -> bool:
+    # Основной фильтр — SECTYPE из snapshot. Пока он не заполнен (самый первый
+    # тик), не отсекаем ничего этим правилом, чтобы не ослепнуть на старте.
+    if EQUITIES and secid not in EQUITIES:
+        return True
     if secid.startswith(EXCLUDED_TICKER_PREFIXES):
         return True
     if any(k in shortname.upper() for k in EXCLUDED_SHORTNAME_KEYWORDS):
@@ -128,10 +163,13 @@ def reset_state() -> None:
     """Сбросить окна и накопленные кеши (после ночи или холодного старта)."""
     WINDOWS.clear()
     LAST_VALTODAY.clear()
-    LAST_NUMTRADES.clear()
     LAST_PRICES.clear()
     FROZEN_BASELINES.clear()
-    # SHORTNAMES не чистим (имена не меняются), COOLDOWNS истекают по времени.
+    VOLUME_ALERTS_TODAY.clear()
+    FLOW_LAST_VALTODAY.clear()
+    order_flow.reset()
+    # SHORTNAMES и EQUITIES не чистим (меняются раз в вечность),
+    # COOLDOWNS истекают по времени.
 
 
 # ============================================================================
@@ -139,20 +177,20 @@ def reset_state() -> None:
 # ============================================================================
 
 def fetch_snapshot() -> Optional[Tuple[
-    Dict[str, str], Dict[str, float], Dict[str, int], Dict[str, dict]
+    Dict[str, str], Dict[str, float], Dict[str, dict]
 ]]:
-    """Один запрос на всю биржу: имена, VALTODAY, NUMTRADES и дневная картина.
+    """Один запрос на всю биржу: имена, VALTODAY и дневная картина.
 
-    Возвращает (shortnames, valtoday, numtrades, daily), где daily[ticker] = {
+    Возвращает (shortnames, valtoday, daily), где daily[ticker] = {
         last, open, low, high, last_to_prev (%), valtoday
     }. Поля могут быть None если данных нет.
     """
     params = {
         "iss.meta": "off",
         "iss.only": "securities,marketdata",
-        "securities.columns": "SECID,SHORTNAME,BOARDID",
+        "securities.columns": "SECID,SHORTNAME,BOARDID,SECTYPE",
         "marketdata.columns":
-            "SECID,BOARDID,VALTODAY,NUMTRADES,LAST,OPEN,LOW,HIGH,LASTTOPREVPRICE",
+            "SECID,BOARDID,VALTODAY,LAST,OPEN,LOW,HIGH,LASTTOPREVPRICE",
     }
     try:
         r = requests.get(SNAPSHOT_URL, params=params, timeout=HTTP_TIMEOUT)
@@ -163,8 +201,12 @@ def fetch_snapshot() -> Optional[Tuple[
         return None
 
     shortnames: Dict[str, str] = {}
-    for secid, shortname, _board in data.get("securities", {}).get("data", []):
+    for secid, shortname, board, sectype in data.get("securities", {}).get("data", []):
         shortnames.setdefault(secid, shortname)
+        # SECTYPE смотрим только на основном режиме: на SMAL/SPEQ у той же
+        # бумаги встречаются свои строки, а нам нужен статус на TQBR.
+        if board == "TQBR" and sectype in ALLOWED_SECTYPES:
+            EQUITIES.add(secid)
 
     # Берём только основной режим TQBR. Параллельные режимы (SMAL — лот=1 шт.,
     # SPEQ и т.п.) имеют свои LAST/HIGH/LOW и крошечный оборот: одна сделка по
@@ -172,16 +214,13 @@ def fetch_snapshot() -> Optional[Tuple[
     # цена туда не ходила. См. GAZP 2026-06-02: SMAL LAST=117.19/HIGH=118.82
     # против TQBR LAST=116.30/HIGH=116.38 при обороте SMAL 6.5 тыс ₽ за день.
     valtoday: Dict[str, float] = {}
-    numtrades: Dict[str, int] = {}
     daily: Dict[str, dict] = {}
-    for secid, board, val, ntr, last, open_, low, high, last_to_prev in \
+    for secid, board, val, last, open_, low, high, last_to_prev in \
             data.get("marketdata", {}).get("data", []):
         if board != "TQBR":
             continue
         if val is not None:
             valtoday[secid] = float(val)
-        if ntr is not None:
-            numtrades[secid] = int(ntr)
         if last is not None:
             daily[secid] = {
                 "last": float(last),
@@ -195,7 +234,7 @@ def fetch_snapshot() -> Optional[Tuple[
         if ticker in daily:
             daily[ticker]["valtoday"] = vt
 
-    return shortnames, valtoday, numtrades, daily
+    return shortnames, valtoday, daily
 
 
 def fetch_index_context() -> Optional[float]:
@@ -284,6 +323,30 @@ def fetch_ticker_trades(secid: str) -> list:
 # ЛОГИКА
 # ============================================================================
 
+def lenta_window_start(trades: list, minutes: float) -> Optional[str]:
+    """Начало окна в ШКАЛЕ ЛЕНТЫ: (самая свежая сделка − minutes), как "HH:MM:SS".
+
+    Публичный ISS отдаёт данные с лагом ~15 минут — это политика биржи, а не
+    наша задержка. Лаг одинаков и у snapshot, и у ленты: замер 24.08.2026
+    показал, что сумма VALUE сделок между двумя отметками ленты совпадает с
+    ΔVALTODAY за тот же интервал с точностью 1.5%. То есть источники синхронны
+    друг с другом и оба сдвинуты относительно стенных часов.
+
+    Поэтому окно сделок нельзя отсчитывать от datetime.now(): «последняя
+    минута» по стенным часам в ленте ещё не существует, и фильтр отдаёт пустоту.
+    Отсчитываем от самой свежей сделки в самой ленте.
+    """
+    times = [t.get("TRADETIME") for t in trades if t.get("TRADETIME")]
+    if not times:
+        return None
+    newest = max(times)
+    try:
+        dt = datetime.strptime(newest, "%H:%M:%S")
+    except ValueError:
+        return None
+    return (dt - timedelta(minutes=minutes)).strftime("%H:%M:%S")
+
+
 def update_windows(valtoday: Dict[str, float]) -> Dict[str, float]:
     """Записать минутные дельты в окна, вернуть {ticker: delta_за_минуту}."""
     deltas: Dict[str, float] = {}
@@ -355,22 +418,13 @@ def detect_anomalies(deltas: Dict[str, float]) -> list:
                 "z": z,
                 "deviation": deviation,
                 "window_size": window_size,
+                # Вторая база сравнения: не «против соседних минут», а
+                # «против этого же времени дня в прошлые сессии».
+                "rel_volume": volume_profile.rel_volume(ticker, delta, now),
             }))
 
     anomalies.sort(key=lambda x: x[1]["z"], reverse=True)
     return anomalies
-
-
-def compute_numtrades_deltas(numtrades: Dict[str, int]) -> Dict[str, int]:
-    """Дельта количества сделок за минуту. Обновляет кеш LAST_NUMTRADES."""
-    deltas: Dict[str, int] = {}
-    for ticker, val in numtrades.items():
-        prev = LAST_NUMTRADES.get(ticker)
-        LAST_NUMTRADES[ticker] = val
-        if prev is None or val < prev:
-            continue
-        deltas[ticker] = val - prev
-    return deltas
 
 
 def compute_price_changes(daily: Dict[str, dict]) -> Dict[str, Tuple[float, float]]:
@@ -392,33 +446,57 @@ def compute_price_changes(daily: Dict[str, dict]) -> Dict[str, Tuple[float, floa
     return changes
 
 
-def detect_block_trades(
-    deltas: Dict[str, float],
-    trade_deltas: Dict[str, int],
-    daily: Dict[str, dict],
-) -> list:
-    """Block trade: мало сделок в минуту, но крупный оборот → средняя сделка огромная."""
-    out = []
-    for ticker, dv in deltas.items():
-        if dv < BLOCK_MIN_MINUTE_VALUE:
-            continue
-        shortname = SHORTNAMES.get(ticker, "")
-        if is_excluded(ticker, shortname):
-            continue
-        dt = trade_deltas.get(ticker)
-        if not dt or dt <= 0:
-            continue
-        avg_size = dv / dt
-        if avg_size < BLOCK_MIN_AVG_TRADE_SIZE:
-            continue
-        out.append((ticker, {
-            "shortname": shortname,
-            "delta": dv,
-            "trades_count": dt,
-            "avg_trade_size": avg_size,
-        }))
-    out.sort(key=lambda x: x[1]["avg_trade_size"], reverse=True)
-    return out
+def pick_big_trade_candidates(deltas: Dict[str, float]) -> List[str]:
+    """Бумаги, где принт на BIG_TRADE_MIN_VALUE физически мог пройти в эту минуту.
+
+    Дешёвый предфильтр: если за минуту суммарно наторговали меньше порога, то
+    одной сделки такого размера там точно не было — лента не нужна.
+    """
+    candidates = [
+        (t, dv) for t, dv in deltas.items()
+        if dv >= BIG_TRADE_MIN_VALUE and not is_excluded(t, SHORTNAMES.get(t, ""))
+    ]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return [t for t, _ in candidates[:BIG_TRADE_MAX_CANDIDATES]]
+
+
+def detect_big_trades(ticker: str, trades: list, delta: float,
+                      minutes: float = 1.0) -> Optional[dict]:
+    """Найти в ленте сделки от BIG_TRADE_MIN_VALUE за последнюю минуту.
+
+    В отличие от прежнего детектора по средней сделке (delta_VAL / delta_NUMTRADES),
+    здесь смотрим размер каждой сделки: 40 принтов по 1 млн больше не выглядят
+    как один принт на 40 млн.
+    """
+    since_str = lenta_window_start(trades, minutes)
+    if since_str is None:
+        return None
+    big = [
+        t for t in trades
+        if (t.get("TRADETIME") or "") >= since_str
+        and float(t.get("VALUE") or 0) >= BIG_TRADE_MIN_VALUE
+    ]
+    if not big:
+        return None
+
+    big.sort(key=lambda t: float(t.get("VALUE") or 0), reverse=True)
+    largest = big[0]
+    buy_value = sum(float(t["VALUE"]) for t in big if t.get("BUYSELL") == "B")
+    sell_value = sum(float(t["VALUE"]) for t in big if t.get("BUYSELL") == "S")
+
+    return {
+        "shortname": SHORTNAMES.get(ticker, ""),
+        "delta": delta,
+        "count": len(big),
+        "largest_value": float(largest.get("VALUE") or 0),
+        "largest_price": float(largest["PRICE"]) if largest.get("PRICE") is not None else None,
+        "largest_qty": int(largest["QUANTITY"]) if largest.get("QUANTITY") is not None else None,
+        "largest_side": largest.get("BUYSELL"),
+        "big_value": buy_value + sell_value,
+        "buy_value": buy_value,
+        "sell_value": sell_value,
+        "trades": big[:3],
+    }
 
 
 def detect_price_spikes(
@@ -451,17 +529,23 @@ def detect_price_spikes(
             "new_price": new_price,
             "change_pct": change_pct,
             "delta": dv,
+            "strong": abs(change_pct) >= SPIKE_STRONG_PRICE_PCT,
         }))
     out.sort(key=lambda x: abs(x[1]["change_pct"]), reverse=True)
     return out
 
 
-def analyze_ticker_trades(trades: list, since: datetime) -> Optional[dict]:
-    """Разложить сделки тикера за последнюю минуту на buy/sell + топ-3 по обороту."""
-    if not trades:
+def analyze_ticker_trades(trades: list, minutes: float = 1.0) -> Optional[dict]:
+    """Разложить сделки тикера за последнюю минуту на buy/sell + топ-3 по обороту.
+
+    Окно берётся по шкале ленты (см. lenta_window_start): при отсчёте от
+    datetime.now() сюда не попадала ни одна сделка, и блок с buy/sell в алерт
+    не выводился вовсе.
+    """
+    since_str = lenta_window_start(trades, minutes)
+    if since_str is None:
         return None
 
-    since_str = since.strftime("%H:%M:%S")
     recent = [t for t in trades if t.get("TRADETIME", "") >= since_str]
     if not recent:
         return None
@@ -517,11 +601,38 @@ def _signal_direction(kind: str, info: dict, details: Optional[dict], daily: Opt
         pct = details.get("price_change_pct") if details else None
         if pct is None:
             pct = daily.get("last_to_prev") if daily else None
-    else:  # block
+    elif kind == "flow":
+        # Для потока «направление» — это сторона перекоса, а не движение цены.
+        return "up" if info["imbalance"] > 0 else "down"
+    elif kind == "bigtrade":
+        # Сторона принта: по ней потом и считать, отрабатывают ли покупки крупным.
+        side = info.get("largest_side")
+        return "up" if side == "B" else "down" if side == "S" else "unknown"
+    else:
         pct = daily.get("last_to_prev") if daily else None
     if pct is None:
         return "unknown"
     return "up" if pct > 0 else "down" if pct < 0 else "flat"
+
+
+# Медиана изменения цены ОТ момента алерта ДО закрытия сессии, по замеру
+# 1508 спайков за 31.07–24.08.2026 (см. MONITOR.md → «Что показала статистика»).
+# Ключ — нижняя граница |Δp| за минуту. Для проколов вниз выборка слабее и
+# на 5%+ ломается (n=7), поэтому там ожидание не показываем.
+_SPIKE_STATS_UP = [(5.0, -3.5, 20), (3.0, -2.2, 103), (2.0, -1.6, 174),
+                   (1.5, -1.2, 156), (1.0, -0.6, 359)]
+_SPIKE_STATS_DOWN = [(3.0, +1.2, 60), (2.0, +0.6, 113), (1.5, +0.2, 148)]
+
+
+def _spike_expectation(info: dict) -> str:
+    """Что исторически делала цена после такого прокола."""
+    pct = abs(info["change_pct"])
+    table = _SPIKE_STATS_UP if info["change_pct"] > 0 else _SPIKE_STATS_DOWN
+    for lower, median, n in table:
+        if pct >= lower:
+            return (f"↩️ Исторически: медиана к закрытию <b>{median:+.1f}%</b> "
+                    f"(n={n}) — движение чаще откатывает")
+    return "↩️ Прокол на тонком стакане — исторически чаще откатывает"
 
 
 def format_alert(
@@ -538,6 +649,13 @@ def format_alert(
     if kind == "spike":
         # Для spike цвет шапки = минутное движение (само событие).
         head_color = _direction_emoji(None, info["change_pct"])
+    elif kind == "flow":
+        head_color = _direction_emoji(None, info["imbalance"])
+    elif kind == "bigtrade":
+        # Цвет по стороне самого принта: событие — это покупка или продажа,
+        # а не то, куда бумага шла с утра.
+        side = info.get("largest_side")
+        head_color = _direction_emoji(None, 1.0 if side == "B" else -1.0 if side == "S" else None)
     elif kind == "volume":
         # Для volume — приоритет минутному движению аномалии, fallback на дневной импульс.
         minute_change = details.get("price_change_pct") if details else None
@@ -549,21 +667,46 @@ def format_alert(
         # block — дневной импульс (минутного движения у block нет).
         head_color = _direction_emoji(daily, None)
 
-    if kind == "block":
-        head = f"{head_color} 🧱 <b>{html.escape(ticker)}</b> — {shortname} · block trade"
+    if kind == "bigtrade":
+        side = info.get("largest_side")
+        side_ru = {"B": "покупка", "S": "продажа"}.get(side, "")
+        head = f"{head_color} 🧱 <b>{html.escape(ticker)}</b> — {shortname} · крупная сделка"
+        largest = f"Сделка: <b>{format_number(info['largest_value'])} руб</b>"
+        if info.get("largest_qty") is not None and info.get("largest_price") is not None:
+            largest += (f" · {info['largest_qty']}@"
+                        f"{format_price(info['largest_price'])}")
+        if side_ru:
+            largest += f" · {side_ru}"
+        body = [largest]
+        if info["count"] > 1:
+            body.append(f"Всего таких сделок за минуту: {info['count']} "
+                        f"(на {format_number(info['big_value'])} руб)")
+        body.append(f"Оборот за минуту: {format_number(info['delta'])} руб")
+    elif kind == "flow":
+        side_ru = "набирают" if info["imbalance"] > 0 else "сливают"
+        head = (f"{head_color} 🎯 <b>{html.escape(ticker)}</b> — {shortname} · "
+                f"поток: {side_ru}")
+        since_str = info["since"].strftime("%H:%M")
         body = [
-            f"Средняя сделка: <b>{format_number(info['avg_trade_size'])} руб</b>",
-            f"Оборот за минуту: {format_number(info['delta'])} руб "
-            f"({info['trades_count']} сделок)",
+            f"Покупки <b>{info['buy_pct']:.0f}%</b> / продажи "
+            f"<b>{info['sell_pct']:.0f}%</b> с {since_str}",
+            f"Перекос: {info['imbalance']*100:+.0f}% "
+            f"на обороте {format_number(info['total_value'])} руб",
         ]
+        if info.get("price_move_pct") is not None:
+            body.append(f"Цена за это время: {info['price_move_pct']:+.2f}% "
+                        f"— поток односторонний, а цена стоит")
     elif kind == "spike":
         arrow = "⬆️" if info["change_pct"] > 0 else "⬇️"
-        head = f"{head_color} ⚡ <b>{html.escape(ticker)}</b> — {shortname} · price spike"
+        strength = "сильный" if info.get("strong") else "слабый"
+        head = (f"{head_color} ⚡ <b>{html.escape(ticker)}</b> — {shortname} · "
+                f"прокол ({strength})")
         body = [
             f"Цена: {format_price(info['prev_price'])} → "
             f"<b>{format_price(info['new_price'])}</b> "
             f"{arrow} ({info['change_pct']:+.2f}% за мин)",
             f"Оборот за минуту: {format_number(info['delta'])} руб",
+            _spike_expectation(info),
         ]
     else:
         multiplier = info["delta"] / info["mean"] if info["mean"] > 0 else 0
@@ -573,6 +716,9 @@ def format_alert(
             f"(×{multiplier:.1f} от среднего)",
             f"Z-score: +{info['z']:.1f} | окно {info['window_size']} мин",
         ]
+        rel = info.get("rel_volume")
+        if rel is not None:
+            body.append(f"К типичному для этого времени дня: <b>×{rel:.1f}</b>")
 
     lines = [head] + body
 
@@ -665,51 +811,99 @@ def send_telegram(text: str) -> bool:
 # ЦИКЛ
 # ============================================================================
 
+def run_order_flow(valtoday: Dict[str, float], now: datetime) -> list:
+    """Раз в FLOW_SCAN_INTERVAL_MINUTES читать ленту по топ-бумагам и копить перекос."""
+    if not order_flow.due_for_scan(now):
+        return []
+
+    watchlist = order_flow.pick_watchlist(valtoday, EQUITIES)
+    for ticker in watchlist:
+        current = valtoday.get(ticker)
+        if current is None:
+            continue
+        prev = FLOW_LAST_VALTODAY.get(ticker)
+        FLOW_LAST_VALTODAY[ticker] = current
+        if prev is None or current <= prev:
+            continue
+        trades = fetch_ticker_trades(ticker)
+        order_flow.update(
+            ticker, trades,
+            interval_value=current - prev,
+            price=LAST_PRICES.get(ticker),
+            now=now,
+        )
+    order_flow.mark_scanned(now)
+    return order_flow.detect(LAST_PRICES, SHORTNAMES)
+
+
 def tick() -> None:
     snapshot = fetch_snapshot()
     if snapshot is None:
         return
-    shortnames, valtoday, numtrades, daily = snapshot
+    shortnames, valtoday, daily = snapshot
 
+    now = datetime.now()
     SHORTNAMES.update(shortnames)
     deltas = update_windows(valtoday)
-    trade_deltas = compute_numtrades_deltas(numtrades)
     price_changes = compute_price_changes(daily)
 
-    signal_log.update_forward_returns(LAST_PRICES, datetime.now())
+    signal_log.update_forward_returns(LAST_PRICES, now)
+
+    # Профиль объёма по времени дня копится всегда, независимо от алертов.
+    volume_profile.accumulate(deltas, now)
+    volume_profile.flush(now)
+    if volume_profile.medians_loaded_for() != now.strftime("%Y-%m-%d"):
+        volume_profile.prune(now)
+        loaded = volume_profile.load_medians(now)
+        log(f"volume profile reloaded: {loaded} (ticker, bucket) медиан")
 
     anomalies = detect_anomalies(deltas)
-    block_trades = detect_block_trades(deltas, trade_deltas, daily)
     spikes = detect_price_spikes(deltas, price_changes)
 
-    # Один тикер может попасть и в volume, и в block, и в spike одновременно —
-    # отдаём приоритет volume, чтобы не дублировать.
-    blocked_tickers = {t for t, _ in anomalies}
-    block_trades = [(t, i) for t, i in block_trades if t not in blocked_tickers]
-    seen_block = blocked_tickers | {t for t, _ in block_trades}
-    spikes = [(t, i) for t, i in spikes if t not in seen_block]
+    # Крупные сделки: дешёвый предфильтр по обороту минуты, лента — только по
+    # выжившим кандидатам.
+    big_trades = []
+    trades_cache: Dict[str, list] = {}
+    for ticker in pick_big_trade_candidates(deltas):
+        trades = fetch_ticker_trades(ticker)
+        trades_cache[ticker] = trades
+        info = detect_big_trades(ticker, trades, delta=deltas[ticker])
+        if info:
+            big_trades.append((ticker, info))
+    big_trades.sort(key=lambda x: x[1]["largest_value"], reverse=True)
+
+    flows = run_order_flow(valtoday, now)
+
+    # Один тикер может попасть и в volume, и в bigtrade, и в spike одновременно —
+    # отдаём приоритет volume, чтобы не дублировать. Поток (flow) живёт своей
+    # логикой: он про часы накопления, а не про эту минуту, и не дублирует их.
+    volume_tickers = {t for t, _ in anomalies}
+    big_trades = [(t, i) for t, i in big_trades if t not in volume_tickers]
+    seen = volume_tickers | {t for t, _ in big_trades}
+    spikes = [(t, i) for t, i in spikes if t not in seen]
 
     parts = []
     if anomalies:
         parts.append("volume: " + ", ".join(
             f"{t}(z={i['z']:.1f})" for t, i in anomalies))
-    if block_trades:
-        parts.append("block: " + ", ".join(
-            f"{t}(avg={format_number(i['avg_trade_size'])})"
-            for t, i in block_trades))
+    if big_trades:
+        parts.append("bigtrade: " + ", ".join(
+            f"{t}({format_number(i['largest_value'])})" for t, i in big_trades))
     if spikes:
         parts.append("spike: " + ", ".join(
             f"{t}({i['change_pct']:+.2f}%)" for t, i in spikes))
+    if flows:
+        parts.append("flow: " + ", ".join(
+            f"{t}({i['imbalance']*100:+.0f}%)" for t, i in flows))
     if parts:
         log(f"snapshot OK {len(valtoday)} tickers · " + " | ".join(parts))
     else:
         log(f"snapshot OK {len(valtoday)} tickers · no anomalies")
 
-    if not (anomalies or block_trades or spikes):
+    if not (anomalies or big_trades or spikes or flows):
         return
 
     market_change_pct = fetch_index_context()
-    now = datetime.now()
 
     def maybe_send(kind: str, ticker: str, info: dict, *, fetch_extras: bool) -> None:
         # Пока volume-волна заморожена — кулдаун игнорируем, шлём каждую минуту.
@@ -717,11 +911,18 @@ def tick() -> None:
         in_wave = bool(frozen and frozen[2] > now)
         if not in_wave and COOLDOWNS.get((kind, ticker), datetime.min) > now:
             return
+        # Дневной потолок для volume действует и внутри волны — иначе одна
+        # длинная волна по-прежнему выгружала бы в канал десятки сообщений.
+        if kind == "volume" and VOLUME_ALERTS_TODAY.get(ticker, 0) >= MAX_VOLUME_ALERTS_PER_DAY:
+            return
         details = None
         orderbook = None
         if fetch_extras:
-            trades = fetch_ticker_trades(ticker)
-            details = analyze_ticker_trades(trades, since=now - timedelta(minutes=1))
+            trades = trades_cache.get(ticker)
+            if trades is None:
+                trades = fetch_ticker_trades(ticker)
+                trades_cache[ticker] = trades
+            details = analyze_ticker_trades(trades)
             orderbook = fetch_orderbook(ticker)
         ticker_daily = daily.get(ticker)
         msg = format_alert(
@@ -731,13 +932,18 @@ def tick() -> None:
         )
         if send_telegram(msg):
             # После волны блокируем тикер ещё на COOLDOWN_MINUTES за пределами freeze.
-            cd_until = (frozen[2] if in_wave else now) + timedelta(minutes=COOLDOWN_MINUTES)
+            cd_minutes = FLOW_COOLDOWN_MINUTES if kind == "flow" else COOLDOWN_MINUTES
+            cd_until = (frozen[2] if in_wave else now) + timedelta(minutes=cd_minutes)
             COOLDOWNS[(kind, ticker)] = cd_until
+            if kind == "volume":
+                VOLUME_ALERTS_TODAY[ticker] = VOLUME_ALERTS_TODAY.get(ticker, 0) + 1
             log(f"alert sent: {kind}/{ticker}")
-            metric_name, metric_value = (
-                ("z_score", info["z"]) if kind == "volume"
-                else ("avg_trade_size", info["avg_trade_size"])
-            )
+            if kind == "volume":
+                metric_name, metric_value = "z_score", info["z"]
+            elif kind == "bigtrade":
+                metric_name, metric_value = "largest_trade_value", info["largest_value"]
+            else:  # flow
+                metric_name, metric_value = "imbalance", info["imbalance"]
             signal_log.log_signal(
                 kind=kind,
                 ticker=ticker,
@@ -752,9 +958,13 @@ def tick() -> None:
 
     for ticker, info in anomalies:
         maybe_send("volume", ticker, info, fetch_extras=True)
-    for ticker, info in block_trades:
-        # У block trade сделок единицы — лезть в /trades.json и /orderbook.json смысла мало.
-        maybe_send("block", ticker, info, fetch_extras=False)
+    for ticker, info in big_trades:
+        # Лента по кандидату уже прочитана в trades_cache — стакан тоже полезен,
+        # видно, съели ли принтом всю плотность.
+        maybe_send("bigtrade", ticker, info, fetch_extras=True)
+    for ticker, info in flows:
+        # Поток — это итог накопления за часы, разовые детали минуты не нужны.
+        maybe_send("flow", ticker, info, fetch_extras=False)
     for ticker, info in spikes:
         # Для spike стакан полезен (увидеть тонкое место), trades — нет.
         if COOLDOWNS.get(("spike", ticker), datetime.min) > now:
@@ -785,14 +995,23 @@ def tick() -> None:
 def main() -> None:
     log("MOEX intraday monitor started")
     log(f"volume: z>{ANOMALY_THRESHOLD_SIGMA}, dev>{MIN_DEVIATION_PERCENT}%, "
-        f"mean>={format_number(MIN_AVG_MINUTE_VALUE)}/мин · freeze {VOLUME_FREEZE_MINUTES} min")
-    log(f"block: val>={format_number(BLOCK_MIN_MINUTE_VALUE)}, "
-        f"avg>={format_number(BLOCK_MIN_AVG_TRADE_SIZE)}/сделка")
-    log(f"spike: |Δp|>={SPIKE_MIN_PRICE_PCT}% за мин, val>={format_number(SPIKE_MIN_DELTA_VAL)}")
-    log(f"window: {WINDOW_MINUTES} min · cooldown: {COOLDOWN_MINUTES} min")
+        f"mean>={format_number(MIN_AVG_MINUTE_VALUE)}/мин · freeze {VOLUME_FREEZE_MINUTES} min "
+        f"· max {MAX_VOLUME_ALERTS_PER_DAY}/день на тикер")
+    log(f"bigtrade: одна сделка >={format_number(BIG_TRADE_MIN_VALUE)} руб "
+        f"· до {BIG_TRADE_MAX_CANDIDATES} кандидатов/мин")
+    log(f"spike: |Δp|>={SPIKE_MIN_PRICE_PCT}% за мин (сильный от "
+        f"{SPIKE_STRONG_PRICE_PCT}%), val>={format_number(SPIKE_MIN_DELTA_VAL)}")
+    log(f"flow: топ-{order_flow.FLOW_WATCH_TOP_N} каждые "
+        f"{order_flow.FLOW_SCAN_INTERVAL_MINUTES} мин · перекос "
+        f">={order_flow.FLOW_MIN_IMBALANCE*100:.0f}% на "
+        f"{format_number(order_flow.FLOW_MIN_SESSION_VALUE)}")
+    log(f"window: {WINDOW_MINUTES} min · cooldown: {COOLDOWN_MINUTES} min "
+        f"(flow {FLOW_COOLDOWN_MINUTES} min)")
+    log(f"instruments: только SECTYPE {'/'.join(ALLOWED_SECTYPES)} на TQBR")
     log("sleep window: 23:50–06:50 MSK")
 
     signal_log.init_db()
+    volume_profile.init_db()
     reset_state()
     sleeping = False
 
@@ -801,7 +1020,12 @@ def main() -> None:
             if is_sleep_time():
                 if not sleeping:
                     log("entering night sleep window, resetting state")
-                    signal_log.finalize_eod(LAST_PRICES, datetime.now())
+                    now = datetime.now()
+                    signal_log.finalize_eod(LAST_PRICES, now)
+                    # Досыпать хвост профиля до сброса состояния, иначе
+                    # последний бакет вечерней сессии теряется каждый день.
+                    written = volume_profile.flush(now, force=True)
+                    log(f"volume profile flushed: {written} строк")
                     reset_state()
                     sleeping = True
                 time.sleep(60)
