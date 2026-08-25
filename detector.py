@@ -580,8 +580,12 @@ def analyze_date(target_date: str, force: bool = False):
         sys.exit(1)
     
     if not target_data:
-        print(f"\n⚠️  Нет данных за {target_date}. Возможно, это выходной день.")
-        sys.exit(0)
+        # Код 3 — «данных пока нет»: либо выходной/праздник, либо ISS ещё не
+        # выложил историю за этот день. Отличается и от успеха, и от ошибки,
+        # чтобы обёртка могла спокойно повторить попытку позже и при этом
+        # ничего не отправлять в Telegram.
+        print(f"\n⚠️  Нет данных за {target_date}. Выходной или история ещё не опубликована.")
+        sys.exit(3)
     
     print(f"\n✓ Загружено: {len(target_data)} тикеров за {target_date}")
     
@@ -648,9 +652,19 @@ def main():
         action='store_true',
         help='Принудительно перезагрузить данные с API (игнорировать кеш)'
     )
-    
+
+    parser.add_argument(
+        '--print-target-date',
+        action='store_true',
+        help='Напечатать дату, которая будет проанализирована, и выйти'
+    )
+
     args = parser.parse_args()
-    
+
+    if args.print_target_date:
+        print(args.date or get_trading_dates(datetime.now() - timedelta(days=1), 1)[0])
+        return
+
     # Создать директории
     ensure_directories()
     

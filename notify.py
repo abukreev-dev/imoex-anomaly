@@ -25,21 +25,20 @@ TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()
 REPORTS_DIR = Path(__file__).resolve().parent / "reports"
 
 
-def get_latest_report():
-    """Получить последний JSON отчет"""
-    # По умолчанию - вчерашний день
-    yesterday = datetime.now() - timedelta(days=1)
-    date_str = yesterday.strftime("%Y-%m-%d")
+def get_report(date_str=None):
+    """Прочитать отчёт за конкретную дату.
+
+    Подставлять «любой последний отчёт», если за нужную дату его нет, нельзя:
+    при запуске до публикации истории на ISS это отправило бы в канал
+    вчерашнее сообщение второй раз.
+    """
+    if date_str is None:
+        yesterday = datetime.now() - timedelta(days=1)
+        date_str = yesterday.strftime("%Y-%m-%d")
 
     report_path = REPORTS_DIR / f"anomalies_{date_str}.json"
-
     if not report_path.exists():
-        # Попробуем найти любой последний отчет
-        reports = sorted(REPORTS_DIR.glob("anomalies_*.json"), reverse=True)
-        if reports:
-            report_path = reports[0]
-        else:
-            return None
+        return None
 
     with open(report_path, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -122,9 +121,11 @@ def send_telegram_message(text):
 def main():
     print("=== Telegram Notification ===")
 
-    report = get_latest_report()
+    date_str = sys.argv[1] if len(sys.argv) > 1 else None
+
+    report = get_report(date_str)
     if not report:
-        print("Отчет не найден")
+        print(f"Отчет за {date_str or 'вчера'} не найден, отправлять нечего")
         return
 
     message = format_telegram_message(report)
