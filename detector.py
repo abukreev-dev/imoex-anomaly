@@ -663,9 +663,11 @@ def main():
     if args.date:
         target_date = args.date
     else:
-        # По умолчанию - вчерашний день
+        # По умолчанию — последний ТОРГОВЫЙ день перед сегодняшним.
+        # Просто «вчера» брать нельзя: при запуске в понедельник это
+        # воскресенье, по которому торгов нет и отчёт выйдет пустым.
         yesterday = datetime.now() - timedelta(days=1)
-        target_date = yesterday.strftime("%Y-%m-%d")
+        target_date = get_trading_dates(yesterday, 1)[0]
     
     # Анализ
     analyze_date(target_date, force=args.force)

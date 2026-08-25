@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-REPORTS_DIR = Path("/app/reports")
+REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 INDEX_FILE = REPORTS_DIR / "index.html"
 
 HTML_TEMPLATE = """<!DOCTYPE html>

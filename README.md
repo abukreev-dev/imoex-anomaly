@@ -58,12 +58,10 @@ imoex-anomaly/
 ├── notify.py                # Telegram уведомления
 ├── requirements.txt         # Зависимости Python
 ├── Makefile                 # Команды для работы с проектом
-├── Dockerfile               # Сборка Docker образа
-├── docker-compose.yml       # Конфигурация Docker
-├── nginx.conf               # Веб-сервер для отчетов
-├── entrypoint.sh            # Скрипт запуска контейнера
-├── cron/
-│   └── detector-cron        # Расписание автозапуска
+├── deploy/
+│   ├── detector-cron.sh     # Обертка для запуска по cron
+│   ├── imoex-detector.cron  # Расписание для /etc/cron.d
+│   └── ...                  # Установка intraday-монитора (см. MONITOR.md)
 ├── web/
 │   └── generate_index.py    # Генератор HTML страницы
 ├── data/                    # Кеш данных (создается автоматически)
@@ -95,19 +93,8 @@ imoex-anomaly/
 | `make init-90` | Загрузить исторические данные за 90 дней |
 | `make notify` | Отправить уведомление в Telegram |
 | `make web` | Сгенерировать HTML страницу с отчетами |
-| `make status` | Показать статус проекта (кол-во данных, отчетов, контейнеров) |
+| `make status` | Показать статус проекта (кол-во данных и отчетов) |
 | `make test` | Проверить импорты |
-
-### Docker
-
-| Команда | Описание |
-|---------|----------|
-| `make docker-build` | Собрать Docker образ |
-| `make docker-up` | Запустить контейнер |
-| `make docker-down` | Остановить контейнер |
-| `make docker-logs` | Показать логи контейнера |
-| `make docker-restart` | Перезапустить контейнер |
-| `make docker-rebuild` | Пересобрать и перезапустить контейнер |
 
 ### Очистка
 
@@ -205,39 +192,33 @@ RETRY_DELAY = 60  # секунд
 }
 ```
 
-## Docker и Coolify
+## Запуск по расписанию
 
-Проект готов к деплою через Docker или Coolify.
-
-### Локальный запуск через Docker
+Детектор ставится на тот же сервер, где работает intraday-монитор
+(см. [MONITOR.md](MONITOR.md)), и запускается системным cron — отдельного
+демона или контейнера не нужно.
 
 ```bash
-make docker-build     # Собрать образ
-make docker-up        # Запустить контейнер
+# Код и env-файл уже на месте после установки монитора
+cd /opt/imoex-anomaly && git pull
 
-# Веб-интерфейс с отчетами
-open http://localhost:8080
+# История за 30 торговых дней (только при первой установке)
+python3 detector.py --init --days 30
+
+# Расписание: будни, 10:00 MSK — анализ вчерашнего дня + отправка в Telegram
+cp deploy/imoex-detector.cron /etc/cron.d/imoex-detector
+chmod 644 /etc/cron.d/imoex-detector
 ```
 
-### Деплой в Coolify
+Обертка `deploy/detector-cron.sh` читает `/etc/imoex-monitor.env` (тот же
+токен, канал и прокси, что у монитора), запускает `detector.py`, затем
+`notify.py`. Лог — `/var/log/imoex-detector.log`.
 
-1. В Coolify создайте новый проект: **Docker Compose**
-2. Укажите репозиторий: `abukreev-dev/imoex-anomaly`
-3. Добавьте переменные окружения (опционально):
-   ```
-   TELEGRAM_BOT_TOKEN=ваш_токен
-   TELEGRAM_CHAT_ID=ваш_chat_id
-   ```
-4. Нажмите Deploy
+Проверить руками, не дожидаясь расписания:
 
-Подробная инструкция: [DEPLOY.md](DEPLOY.md)
-
-### Возможности Docker-версии
-
-- Веб-интерфейс для просмотра отчетов
-- Автозапуск анализа по cron (10:00 MSK, Пн-Пт)
-- Telegram уведомления об аномалиях
-- Персистентное хранение данных и отчетов
+```bash
+/opt/imoex-anomaly/deploy/detector-cron.sh
+```
 
 ## Telegram уведомления
 

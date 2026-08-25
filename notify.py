@@ -18,8 +18,11 @@ except ImportError:
 # Настройки из переменных окружения
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# Прокси только для api.telegram.org: на сервере прямой доступ к нему закрыт,
+# запросы к MOEX при этом идут напрямую (как в monitor.py).
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()
 
-REPORTS_DIR = Path("/app/reports")
+REPORTS_DIR = Path(__file__).resolve().parent / "reports"
 
 
 def get_latest_report():
@@ -104,8 +107,10 @@ def send_telegram_message(text):
         "disable_web_page_preview": True
     }
 
+    proxies = {"http": TELEGRAM_PROXY, "https": TELEGRAM_PROXY} if TELEGRAM_PROXY else None
+
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10, proxies=proxies)
         response.raise_for_status()
         print("✓ Уведомление отправлено в Telegram")
         return True

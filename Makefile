@@ -1,9 +1,8 @@
-.PHONY: help run init notify web docker-build docker-up docker-down docker-logs clean install
+.PHONY: help run init notify web clean install
 
 # Переменные
 PYTHON := python3
 PIP := pip3
-DOCKER_COMPOSE := docker-compose
 
 # Цвета для вывода
 BLUE := \033[0;34m
@@ -64,28 +63,6 @@ web: ## Сгенерировать HTML страницу с отчетами
 	$(PYTHON) web/generate_index.py
 	@echo "$(GREEN)Страница сгенерирована!$(NC)"
 
-docker-build: ## Собрать Docker образ
-	@echo "$(BLUE)Собираю Docker образ...$(NC)"
-	$(DOCKER_COMPOSE) build
-	@echo "$(GREEN)Образ собран!$(NC)"
-
-docker-up: ## Запустить контейнер через docker-compose
-	@echo "$(BLUE)Запускаю контейнер...$(NC)"
-	$(DOCKER_COMPOSE) up -d
-	@echo "$(GREEN)Контейнер запущен! Веб-интерфейс: http://localhost:8080$(NC)"
-
-docker-down: ## Остановить контейнер
-	@echo "$(BLUE)Останавливаю контейнер...$(NC)"
-	$(DOCKER_COMPOSE) down
-	@echo "$(GREEN)Контейнер остановлен!$(NC)"
-
-docker-logs: ## Показать логи контейнера
-	$(DOCKER_COMPOSE) logs -f
-
-docker-restart: docker-down docker-up ## Перезапустить контейнер
-
-docker-rebuild: docker-down docker-build docker-up ## Пересобрать и перезапустить контейнер
-
 clean: ## Очистить кеш и временные файлы
 	@echo "$(BLUE)Очищаю временные файлы...$(NC)"
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -111,7 +88,6 @@ status: ## Показать статус проекта
 	@echo "$(BLUE)Статус проекта:$(NC)"
 	@echo "Данные: $$(ls -1 data/*.json 2>/dev/null | wc -l | xargs) файлов"
 	@echo "Отчеты: $$(ls -1 reports/*.json 2>/dev/null | wc -l | xargs) файлов"
-	@echo "Docker: $$($(DOCKER_COMPOSE) ps -q 2>/dev/null | wc -l | xargs) контейнеров запущено"
 
 test: ## Быстрый тест (проверка импортов)
 	@echo "$(BLUE)Проверяю импорты...$(NC)"

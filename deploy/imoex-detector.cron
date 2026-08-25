@@ -1,0 +1,11 @@
+# Daily-детектор аномальных объёмов MOEX.
+# Ставится как /etc/cron.d/imoex-detector (владелец root, права 644).
+#
+# Считаем ВЧЕРАШНИЙ торговый день, поэтому по будням: во вторник считается
+# понедельник, в пятницу — четверг. Пятница разбирается в понедельник.
+# 10:00 MSK — история за прошлый день на ISS к этому моменту уже опубликована.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 10 * * 1-5 root /opt/imoex-anomaly/deploy/detector-cron.sh >> /var/log/imoex-detector.log 2>&1
