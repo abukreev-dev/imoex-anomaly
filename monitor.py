@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 # Все datetime.now() / time.localtime() в MSK независимо от TZ системы.
@@ -47,6 +47,24 @@ VOLUME_FREEZE_MINUTES = 5
 # (z=25 предсказывает ровно столько же, сколько z=8), поэтому режем поток:
 # волна SGZH 04.08.2026 дала 27 алертов за день, теперь даст не больше 3.
 MAX_VOLUME_ALERTS_PER_DAY = 3
+
+# Из этих трёх слотов последний зарезервирован под предзакрытие и до
+# VOLUME_RESERVED_SLOT_FROM бумаге недоступен — до этого времени её потолок
+# фактически равен 2.
+#
+# Замер 25.08.2026 (см. MONITOR.md): потолок «сколько-то сообщений в день»
+# тратится по принципу «кто первый», и к обеду половина ликвидных бумаг
+# замолкала на весь остаток сессии. Поднимать потолок бесполезно — у всех
+# семи бумаг, промолчавших в предзакрытии, обнаружений до 18:50 было 6–12,
+# так что любой дневной бюджет они выбирали задолго до закрытия. Работает
+# только слот, который физически недоступен раньше времени: на данных того
+# дня резерв вернул в канал все 7 предзакрывочных сигналов и при этом
+# СНИЗИЛ общий трафик (78 сообщений против 85 фактических).
+#
+# 18:30 — с поправкой на лаг ISS ~15 мин это соответствует закрытию основной
+# сессии и аукциону закрытия 18:40–18:50 по биржевому времени.
+VOLUME_RESERVED_SLOT_FROM = dtime(18, 30)
+VOLUME_RESERVED_SLOTS = 1
 
 # Поток накапливается часами и, сработав, остаётся сработавшим — обычных
 # 30 минут мало, иначе одна и та же бумага уедет в канал двадцать раз за день.
@@ -157,6 +175,18 @@ def is_sleep_time(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now()
     mins = now.hour * 60 + now.minute
     return mins >= SLEEP_START_MIN or mins < SLEEP_END_MIN
+
+
+def volume_budget(now: datetime) -> int:
+    """Сколько volume-алертов по бумаге разрешено к этому моменту дня.
+
+    До VOLUME_RESERVED_SLOT_FROM зарезервированные слоты недоступны, после —
+    открываются. Считается от момента отправки, а не от начала дня, поэтому
+    бумага, выбравшая ранний бюджет, к предзакрытию снова получает голос.
+    """
+    if now.time() < VOLUME_RESERVED_SLOT_FROM:
+        return MAX_VOLUME_ALERTS_PER_DAY - VOLUME_RESERVED_SLOTS
+    return MAX_VOLUME_ALERTS_PER_DAY
 
 
 def reset_state() -> None:
@@ -920,7 +950,9 @@ def tick() -> None:
             return
         # Дневной потолок для volume действует и внутри волны — иначе одна
         # длинная волна по-прежнему выгружала бы в канал десятки сообщений.
-        if kind == "volume" and VOLUME_ALERTS_TODAY.get(ticker, 0) >= MAX_VOLUME_ALERTS_PER_DAY:
+        # Последний слот открывается только к предзакрытию, чтобы утренняя
+        # активность не оставляла бумагу немой на самое интересное время.
+        if kind == "volume" and VOLUME_ALERTS_TODAY.get(ticker, 0) >= volume_budget(now):
             return
         details = None
         orderbook = None
@@ -1003,7 +1035,8 @@ def main() -> None:
     log("MOEX intraday monitor started")
     log(f"volume: z>{ANOMALY_THRESHOLD_SIGMA}, dev>{MIN_DEVIATION_PERCENT}%, "
         f"mean>={format_number(MIN_AVG_MINUTE_VALUE)}/мин · freeze {VOLUME_FREEZE_MINUTES} min "
-        f"· max {MAX_VOLUME_ALERTS_PER_DAY}/день на тикер")
+        f"· max {MAX_VOLUME_ALERTS_PER_DAY}/день на тикер, из них "
+        f"{VOLUME_RESERVED_SLOTS} с {VOLUME_RESERVED_SLOT_FROM.strftime('%H:%M')}")
     log(f"bigtrade: одна сделка >={format_number(BIG_TRADE_MIN_VALUE)} руб "
         f"· до {BIG_TRADE_MAX_CANDIDATES} кандидатов/мин")
     log(f"spike: |Δp|>={SPIKE_MIN_PRICE_PCT}% за мин (сильный от "
