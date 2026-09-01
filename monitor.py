@@ -63,7 +63,15 @@ MAX_VOLUME_ALERTS_PER_DAY = 3
 #
 # 18:30 — с поправкой на лаг ISS ~15 мин это соответствует закрытию основной
 # сессии и аукциону закрытия 18:40–18:50 по биржевому времени.
+#
+# У резерва есть срок годности: после VOLUME_RESERVED_SLOT_UNTIL слот снова
+# закрывается. Замер 31.08.2026 (178 обнаружений, самый нагруженный день) —
+# из 13 потраченных резервных слотов только 3 ушли в окно закрытия, а 10 —
+# в вечерку, местами на сигнал слабее срезанного утром (SMLT: резерв в 21:00
+# на z=9.7 при срезанном z=49.5). Слот, который держат под аукцион, не должен
+# доставаться тому, кто просто дождался вечера.
 VOLUME_RESERVED_SLOT_FROM = dtime(18, 30)
+VOLUME_RESERVED_SLOT_UNTIL = dtime(19, 30)
 VOLUME_RESERVED_SLOTS = 1
 
 # Поток накапливается часами и, сработав, остаётся сработавшим — обычных
@@ -80,7 +88,13 @@ BIG_TRADE_MAX_CANDIDATES = 25           # потолок доп. запросо�
 # По статистике это разворотный сигнал: 77% спайков вверх откатывают, медиана
 # возврата к концу дня растёт монотонно с силой прокола (−0.57% на 1–1.5%,
 # −3.51% на 5%+). Сильным считаем от SPIKE_STRONG_PRICE_PCT.
-SPIKE_MIN_PRICE_PCT = 1.0               # |Δцены за минуту| ≥ 1%
+SPIKE_MIN_PRICE_PCT = 1.0               # |Δцены за минуту| ≥ 1% (вверх)
+# Вниз слабый бакет отключён: замеры 25.08 и 29.08.2026 дали по проколам вниз
+# 1–2% ровно 0.00% к закрытию во всех четырёх неделях при 42–48% разворотов —
+# это не слабый эффект, а его отсутствие, устойчивое по неделям. Ценой в 629
+# сообщений из 1877 (~28 в день, пятая часть канала). Порог ВВЕРХ не трогаем:
+# он подтверждён четыре недели подряд, см. MONITOR.md.
+SPIKE_MIN_PRICE_PCT_DOWN = 2.0          # |Δцены за минуту| ≥ 2% (вниз)
 SPIKE_STRONG_PRICE_PCT = 2.0            # выше — разворот заметно надёжнее
 SPIKE_MIN_DELTA_VAL = 50_000            # руб, минимум — хоть что-то торговалось
 SPIKE_MAX_DELTA_VS_MEAN = 3.0           # выше — это уже volume anomaly, не spike
@@ -180,13 +194,21 @@ def is_sleep_time(now: Optional[datetime] = None) -> bool:
 def volume_budget(now: datetime) -> int:
     """Сколько volume-алертов по бумаге разрешено к этому моменту дня.
 
-    До VOLUME_RESERVED_SLOT_FROM зарезервированные слоты недоступны, после —
-    открываются. Считается от момента отправки, а не от начала дня, поэтому
-    бумага, выбравшая ранний бюджет, к предзакрытию снова получает голос.
+    Зарезервированный слот открыт только в окне предзакрытия
+    [VOLUME_RESERVED_SLOT_FROM, VOLUME_RESERVED_SLOT_UNTIL). Считается от
+    момента отправки, а не от начала дня, поэтому бумага, выбравшая ранний
+    бюджет, к предзакрытию снова получает голос — и теряет его к вечерке.
+
+    На выходной сессии резервировать не подо что: замер 29.08.2026 показал,
+    что сигналы укладываются в 10:15–18:24 и окно резерва не наступает
+    никогда, а потолок при этом режет (4 сигнала за 29.08). Отдаём весь
+    бюджет сразу.
     """
-    if now.time() < VOLUME_RESERVED_SLOT_FROM:
-        return MAX_VOLUME_ALERTS_PER_DAY - VOLUME_RESERVED_SLOTS
-    return MAX_VOLUME_ALERTS_PER_DAY
+    if now.weekday() >= 5:
+        return MAX_VOLUME_ALERTS_PER_DAY
+    if VOLUME_RESERVED_SLOT_FROM <= now.time() < VOLUME_RESERVED_SLOT_UNTIL:
+        return MAX_VOLUME_ALERTS_PER_DAY
+    return MAX_VOLUME_ALERTS_PER_DAY - VOLUME_RESERVED_SLOTS
 
 
 def reset_state() -> None:
@@ -536,7 +558,8 @@ def detect_price_spikes(
     """Price spike: цена двинулась на ≥ N% при обычном/малом объёме."""
     out = []
     for ticker, (prev_price, change_pct) in price_changes.items():
-        if abs(change_pct) < SPIKE_MIN_PRICE_PCT:
+        floor = SPIKE_MIN_PRICE_PCT if change_pct > 0 else SPIKE_MIN_PRICE_PCT_DOWN
+        if abs(change_pct) < floor:
             continue
         shortname = SHORTNAMES.get(ticker, "")
         if is_excluded(ticker, shortname):
@@ -655,7 +678,9 @@ def _signal_direction(kind: str, info: dict, details: Optional[dict], daily: Opt
 # от 2% слиты в один. Ниже 1.5% отскока нет вовсе — см. _spike_expectation.
 _SPIKE_STATS_UP = [(5.0, -3.7, 22), (3.0, -2.2, 112), (2.0, -1.6, 188),
                    (1.5, -1.2, 160), (1.0, -0.6, 366)]
-_SPIKE_STATS_DOWN = [(2.0, +0.6, 181), (1.5, +0.2, 149)]
+# Бакет (1.5, +0.2, 149) убран вместе с самим сигналом — проколы вниз слабее
+# SPIKE_MIN_PRICE_PCT_DOWN до формата больше не доходят.
+_SPIKE_STATS_DOWN = [(2.0, +0.6, 181)]
 
 
 def _spike_expectation(info: dict) -> str:
@@ -666,10 +691,9 @@ def _spike_expectation(info: dict) -> str:
         if pct >= lower:
             return (f"↩️ Исторически: медиана к закрытию <b>{median:+.1f}%</b> "
                     f"(n={n}) — движение чаще откатывает")
-    # Сюда попадают только падения 1.0–1.5%: медиана к закрытию ровно 0.00%
-    # на n=378, разворот в 56% случаев — то есть монетка. Обещать здесь откат
-    # нельзя, это была бы неправда.
-    return "↩️ Исторически: к закрытию <b>±0.0%</b> (n=378) — отскока нет, это шум"
+    # Недостижимо: обе таблицы начинаются с порога детекта. Страховка на
+    # случай, если пороги разойдутся с таблицами при следующей правке.
+    return "↩️ Исторически: статистики по такому проколу нет"
 
 
 def format_alert(
@@ -1036,10 +1060,14 @@ def main() -> None:
     log(f"volume: z>{ANOMALY_THRESHOLD_SIGMA}, dev>{MIN_DEVIATION_PERCENT}%, "
         f"mean>={format_number(MIN_AVG_MINUTE_VALUE)}/мин · freeze {VOLUME_FREEZE_MINUTES} min "
         f"· max {MAX_VOLUME_ALERTS_PER_DAY}/день на тикер, из них "
-        f"{VOLUME_RESERVED_SLOTS} с {VOLUME_RESERVED_SLOT_FROM.strftime('%H:%M')}")
+        f"{VOLUME_RESERVED_SLOTS} только в "
+        f"{VOLUME_RESERVED_SLOT_FROM.strftime('%H:%M')}–"
+        f"{VOLUME_RESERVED_SLOT_UNTIL.strftime('%H:%M')} "
+        f"(на выходных резерва нет)")
     log(f"bigtrade: одна сделка >={format_number(BIG_TRADE_MIN_VALUE)} руб "
         f"· до {BIG_TRADE_MAX_CANDIDATES} кандидатов/мин")
-    log(f"spike: |Δp|>={SPIKE_MIN_PRICE_PCT}% за мин (сильный от "
+    log(f"spike: |Δp|>={SPIKE_MIN_PRICE_PCT}% вверх / "
+        f"{SPIKE_MIN_PRICE_PCT_DOWN}% вниз за мин (сильный от "
         f"{SPIKE_STRONG_PRICE_PCT}%), val>={format_number(SPIKE_MIN_DELTA_VAL)}")
     log(f"flow: топ-{order_flow.FLOW_WATCH_TOP_N} каждые "
         f"{order_flow.FLOW_SCAN_INTERVAL_MINUTES} мин · перекос "

@@ -69,8 +69,22 @@ def bucket_of(now: datetime) -> int:
     return (now.hour * 60 + now.minute) // BUCKET_MINUTES
 
 
+def is_profile_day(day: datetime) -> bool:
+    """Копим и считаем медианы только по будням.
+
+    Замер 29.08.2026: у пар «тикер + бакет», где есть оба типа дней, медиана
+    выходного дня — 0.12 от буднего. На окне 30 дней примерно девять будут
+    выходными и потянут медиану вниз, завышая «×N к типичному для этого
+    времени дня» в буднем алерте. На детект это не влияет (rel_volume только
+    печатается), но чинить дешевле до того, как окно наберётся.
+    """
+    return day.weekday() < 5
+
+
 def accumulate(deltas: Dict[str, float], now: datetime) -> None:
     """Досыпать минутные дельты в текущий бакет (в памяти)."""
+    if not is_profile_day(now):
+        return
     date = now.strftime("%Y-%m-%d")
     b = bucket_of(now)
     for ticker, value in deltas.items():
@@ -130,11 +144,15 @@ def load_medians(now: datetime) -> int:
     conn = _get_conn()
     try:
         # Текущий день исключаем: он ещё не полон и сам себя объяснять не должен.
-        for ticker, bucket, value in conn.execute(
-            "SELECT ticker, bucket, value FROM volume_profile "
+        for trade_date, ticker, bucket, value in conn.execute(
+            "SELECT trade_date, ticker, bucket, value FROM volume_profile "
             "WHERE trade_date >= ? AND trade_date < ?",
             (cutoff, today),
         ):
+            # Выходные, накопленные до этой правки, из медиан выбрасываем —
+            # иначе они доживут в базе до конца окна PROFILE_DAYS.
+            if not is_profile_day(datetime.strptime(trade_date, "%Y-%m-%d")):
+                continue
             per_key[(ticker, bucket)].append(float(value))
     finally:
         conn.close()
