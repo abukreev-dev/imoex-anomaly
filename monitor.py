@@ -289,8 +289,8 @@ def fetch_snapshot() -> Optional[Tuple[
     return shortnames, valtoday, daily
 
 
-def fetch_index_context() -> Optional[float]:
-    """Изменение индекса за день в %. None при любой ошибке.
+def fetch_index_context() -> Optional[Tuple[float, float]]:
+    """Изменение индекса за день в % и его текущее абсолютное значение. None при любой ошибке.
 
     Берём IMOEX2: днём он совпадает с IMOEX, а в вечернюю сессию (после 19:00)
     продолжает обновляться, тогда как IMOEX замирает на закрытии основной сессии.
@@ -298,15 +298,15 @@ def fetch_index_context() -> Optional[float]:
     params = {
         "iss.meta": "off",
         "iss.only": "marketdata",
-        "marketdata.columns": "SECID,LASTCHANGEPRC",
+        "marketdata.columns": "SECID,LASTCHANGEPRC,LAST",
     }
     try:
         r = requests.get(INDEX_URL, params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         for row in data.get("marketdata", {}).get("data", []):
-            if len(row) >= 2 and row[0] == "IMOEX2" and row[1] is not None:
-                return float(row[1])
+            if len(row) >= 3 and row[0] == "IMOEX2" and row[1] is not None and row[2] is not None:
+                return float(row[1]), float(row[2])
     except Exception as e:
         log(f"index error: {e}")
     return None
@@ -701,7 +701,7 @@ def format_alert(
     info: dict,
     details: Optional[dict],
     daily: Optional[dict],
-    market_change_pct: Optional[float],
+    market_index: Optional[Tuple[float, float]],
     orderbook: Optional[dict],
     kind: str = "volume",
 ) -> str:
@@ -802,8 +802,9 @@ def format_alert(
         if vt:
             lines.append(f"Оборот за день: {format_number(vt)} руб")
 
-    if market_change_pct is not None:
-        lines.append(f"IMOEX: {market_change_pct:+.2f}%")
+    if market_index is not None:
+        market_change_pct, market_last = market_index
+        lines.append(f"IMOEX: {market_change_pct:+.2f}% ({format_price(market_last)})")
 
     if details:
         lines.append("")
@@ -964,7 +965,8 @@ def tick() -> None:
     if not (anomalies or big_trades or spikes or flows):
         return
 
-    market_change_pct = fetch_index_context()
+    market_index = fetch_index_context()
+    market_change_pct = market_index[0] if market_index is not None else None
 
     def maybe_send(kind: str, ticker: str, info: dict, *, fetch_extras: bool) -> None:
         # Пока volume-волна заморожена — кулдаун игнорируем, шлём каждую минуту.
@@ -990,7 +992,7 @@ def tick() -> None:
         ticker_daily = daily.get(ticker)
         msg = format_alert(
             ticker, info, details,
-            ticker_daily, market_change_pct, orderbook,
+            ticker_daily, market_index, orderbook,
             kind=kind,
         )
         if send_telegram(msg):
@@ -1036,7 +1038,7 @@ def tick() -> None:
         ticker_daily = daily.get(ticker)
         msg = format_alert(
             ticker, info, None,
-            ticker_daily, market_change_pct, orderbook,
+            ticker_daily, market_index, orderbook,
             kind="spike",
         )
         if send_telegram(msg):
