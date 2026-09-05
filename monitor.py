@@ -298,7 +298,7 @@ def fetch_index_context() -> Optional[Tuple[float, float]]:
     params = {
         "iss.meta": "off",
         "iss.only": "marketdata",
-        "marketdata.columns": "SECID,LASTCHANGEPRC,LAST",
+        "marketdata.columns": "SECID,LASTCHANGEPRC,CURRENTVALUE",
     }
     try:
         r = requests.get(INDEX_URL, params=params, timeout=HTTP_TIMEOUT)
